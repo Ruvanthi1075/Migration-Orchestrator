@@ -1,0 +1,8 @@
+{
+  "flows": [
+    {"name": "hospital_traffic", "source": "h1", "destination": "h6", "importance": "High"},
+    {"name": "banking_traffic",  "source": "h3", "destination": "h8", "importance": "High"},
+    {"name": "video_traffic",    "source": "h5", "destination": "h2", "importance": "Low"},
+    {"name": "iot_traffic",      "source": "h7", "destination": "h4", "importance": "Medium"}
+  ]
+}

@@ -1,0 +1,15 @@
+# secrets -- never commit these
+*.pem
+*.key
+migration/certs/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+sdn-env/
+
+# results you regenerate, not hand-authored
+results/logs/*.csv
+results/logs/*.json
+results/plots/*.png
