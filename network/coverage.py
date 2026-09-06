@@ -16,15 +16,64 @@ import networkx as nx
 # Legacy = classical TLS only, Hybrid = classical + PQC
 SECURITY_LEVEL = {"Legacy": 0, "Hybrid": 1}
 
-# simple, defensible weight mapping -- keep it in one place
+# Legacy categorical weight mapping -- kept for flows_config.json files
+# that only specify "importance": "High"/"Medium"/"Low". Superseded by
+# flow_weight() below when a flow specifies the multi-factor fields.
 IMPORTANCE_WEIGHT = {"High": 3, "Medium": 2, "Low": 1}
+
+# Feature 4.2: Business-Aware Flow Weighting (SAW -- Simple Additive
+# Weighting). weight(flow) = w_c*criticality + w_s*security_sla +
+# w_l*latency_sla, each factor already normalized to 0-1 by whoever
+# populates flows_config.json. Weights must sum to 1. These particular
+# values (criticality dominant, security SLA next, latency SLA least)
+# are a starting judgment call, not derived -- if that needs defending
+# to stakeholders, re-derive them with AHP (pairwise comparisons) or
+# CRITIC (data-driven) instead of hand-picking.
+SAW_WEIGHTS = {"criticality": 0.5, "security_sla": 0.3, "latency_sla": 0.2}
 
 
 def load_flows(path):
-    """Load the flow list written by Feature 1."""
+    """
+    Load the flow list written by Feature 1, and precompute each
+    flow's weight (Feature 4.2) once up front so downstream code
+    (total_coverage, the optimizer) reads flow["weight"] directly
+    instead of re-deriving it from raw fields every call.
+    """
     with open(path, "r") as f:
         data = json.load(f)
-    return data["flows"]
+    flows = data["flows"]
+    for flow in flows:
+        flow["weight"] = flow_weight(flow)
+    return flows
+
+
+def flow_weight(flow):
+    """
+    Compute weight(flow) per Feature 4.2. Two supported formats:
+
+      - Multi-factor (SAW): flow has "criticality", "security_sla",
+        and "latency_sla", each already normalized to 0-1. Weight is
+        the SAW_WEIGHTS-weighted sum of the three.
+      - Legacy categorical: flow has "importance": "High"/"Medium"/
+        "Low". Falls back to IMPORTANCE_WEIGHT, for flows_config.json
+        files written before Feature 4.2.
+
+    Raises ValueError if a flow has neither -- silently defaulting to
+    0 would make that flow invisible to total_coverage without any
+    signal that its weight fields are missing.
+    """
+    if all(k in flow for k in ("criticality", "security_sla", "latency_sla")):
+        return (
+            SAW_WEIGHTS["criticality"] * flow["criticality"]
+            + SAW_WEIGHTS["security_sla"] * flow["security_sla"]
+            + SAW_WEIGHTS["latency_sla"] * flow["latency_sla"]
+        )
+    if "importance" in flow:
+        return IMPORTANCE_WEIGHT[flow["importance"]]
+    raise ValueError(
+        f"flow has neither criticality/security_sla/latency_sla nor "
+        f"importance -- cannot compute weight: {flow}"
+    )
 
 
 def get_path_links(graph, source, destination):
@@ -54,16 +103,20 @@ def path_security_level(graph, path_links):
 
 def total_coverage(graph, flows):
     """
-    Sum, across every flow, of: importance_weight(flow) x
-    weakest_link_score(flow's path). This is the single number
-    Feature 3 tries to maximize by choosing which link to upgrade
-    next.
+    Sum, across every flow, of: weight(flow) x weakest_link_score
+    (flow's path). This is the single number Feature 3 tries to
+    maximize by choosing which link to upgrade next.
+
+    Uses flow["weight"] if load_flows already precomputed it;
+    otherwise calls flow_weight(flow) directly, so this also works on
+    flow lists built by hand (e.g. in tests) rather than only ones
+    loaded from flows_config.json.
     """
     score = 0
     for flow in flows:
         path_links = get_path_links(graph, flow["source"], flow["destination"])
         level = path_security_level(graph, path_links)
-        weight = IMPORTANCE_WEIGHT[flow["importance"]]
+        weight = flow["weight"] if "weight" in flow else flow_weight(flow)
         score += weight * level
     return score
 
@@ -71,21 +124,17 @@ def total_coverage(graph, flows):
 if __name__ == "__main__":
     # self-test against the real project topology (matches topo.py)
     from topology import build_graph, PROJECT_TOPO
-
     graph = build_graph(PROJECT_TOPO)
     flows = load_flows("flows_config.json")
-
     # Sanity check: with the triangle in place, hospital_traffic's
     # shortest path (h1 -> h6) should use the s1-s2 cross-link, not
     # detour through the core switch s0.
     hospital_path = get_path_links(graph, "h1", "h6")
     print("hospital_traffic path:", hospital_path)
     assert ("s1", "s2") in hospital_path or ("s2", "s1") in hospital_path
-
     print("All links Legacy -> total coverage =", total_coverage(graph, flows))
     # every path's weakest link is Legacy (0), so score must be 0
     assert total_coverage(graph, flows) == 0
-
     # upgrade only the backbone (agg<->core, and the cross-link) -- every
     # flow crosses agg-A/agg-B, so ALL of them still fail on their
     # unmigrated edge/host-facing hop
@@ -93,7 +142,6 @@ if __name__ == "__main__":
         graph.edges[a, b]["state"] = "Hybrid"
     print("Backbone-only Hybrid -> total coverage =", total_coverage(graph, flows))
     assert total_coverage(graph, flows) == 0
-
     # now fully upgrade hospital_traffic's actual path (h1-s3-s1-s2-s5-h6)
     for a, b in [("h1", "s3"), ("s3", "s1"), ("s5", "s2"), ("s5", "h6")]:
         if graph.has_edge(a, b):
@@ -101,5 +149,11 @@ if __name__ == "__main__":
     print("hospital path fully Hybrid -> total coverage =", total_coverage(graph, flows))
     # hospital_traffic weight 3 x level 1 = 3; others still 0
     assert total_coverage(graph, flows) == 3
-
     print("All self-checks passed.")
+
+    # Feature 4.2 self-check: multi-factor SAW weighting, independent
+    # of flows_config.json's categorical flows above.
+    saw_flow = {"criticality": 1.0, "security_sla": 1.0, "latency_sla": 0.0}
+    expected = SAW_WEIGHTS["criticality"] * 1.0 + SAW_WEIGHTS["security_sla"] * 1.0
+    assert flow_weight(saw_flow) == expected
+    print(f"SAW weight check passed: {saw_flow} -> {flow_weight(saw_flow)}")

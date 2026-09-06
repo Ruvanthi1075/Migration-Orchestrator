@@ -1,0 +1,106 @@
+2026.08.09 23:05:35 LOG6[ui]: Initializing inetd mode configuration
+2026.08.09 23:05:35 LOG5[ui]: stunnel 5.63 on x86_64-pc-linux-gnu platform
+2026.08.09 23:05:35 LOG5[ui]: Compiled with OpenSSL 3.0.2 15 Mar 2022
+2026.08.09 23:05:35 LOG5[ui]: Running  with OpenSSL 3.5.8-dev 
+2026.08.09 23:05:35 LOG5[ui]: Update OpenSSL shared libraries or rebuild stunnel
+2026.08.09 23:05:35 LOG5[ui]: Threading:PTHREAD Sockets:POLL,IPv6,SYSTEMD TLS:ENGINE,OCSP,PSK,SNI Auth:LIBWRAP
+2026.08.09 23:05:35 LOG6[ui]: Initializing inetd mode configuration
+2026.08.09 23:05:35 LOG5[ui]: Reading configuration from file /home/sahana/Migration-Orchestrator/migration/stunnel_configs/server.conf
+2026.08.09 23:05:35 LOG5[ui]: UTF-8 byte order mark not detected
+2026.08.09 23:05:35 LOG5[ui]: FIPS mode disabled
+2026.08.09 23:05:35 LOG6[ui]: Compression enabled: 0 methods
+2026.08.09 23:05:35 LOG6[ui]: Initializing service [classical-test]
+2026.08.09 23:05:35 LOG6[ui]: OpenSSL security level is used: 2
+2026.08.09 23:05:35 LOG6[ui]: Session resumption enabled
+2026.08.09 23:05:35 LOG6[ui]: Loading certificate from file: /home/sahana/Migration-Orchestrator/migration/certs/server.crt
+2026.08.09 23:05:35 LOG6[ui]: Certificate loaded from file: /home/sahana/Migration-Orchestrator/migration/certs/server.crt
+2026.08.09 23:05:35 LOG6[ui]: Loading private key from file: /home/sahana/Migration-Orchestrator/migration/certs/server.key
+2026.08.09 23:05:35 LOG6[ui]: Private key loaded from file: /home/sahana/Migration-Orchestrator/migration/certs/server.key
+2026.08.09 23:05:35 LOG6[ui]: DH initialization skipped: no DH ciphersuites
+2026.08.09 23:05:35 LOG5[ui]: Configuration successful
+2026.08.09 23:05:35 LOG6[ui]: Service [classical-test] (FD=9) bound to 127.0.0.1:8443
+2026.08.09 23:05:35 LOG3[ui]: Cannot create pid file /var/run/stunnel4.pid
+2026.08.09 23:05:35 LOG3[ui]: create: Permission denied (13)
+2026.08.09 23:05:56 LOG6[ui]: Initializing inetd mode configuration
+2026.08.09 23:05:56 LOG5[ui]: stunnel 5.63 on x86_64-pc-linux-gnu platform
+2026.08.09 23:05:56 LOG5[ui]: Compiled with OpenSSL 3.0.2 15 Mar 2022
+2026.08.09 23:05:56 LOG5[ui]: Running  with OpenSSL 3.5.8-dev 
+2026.08.09 23:05:56 LOG5[ui]: Update OpenSSL shared libraries or rebuild stunnel
+2026.08.09 23:05:56 LOG5[ui]: Threading:PTHREAD Sockets:POLL,IPv6,SYSTEMD TLS:ENGINE,OCSP,PSK,SNI Auth:LIBWRAP
+2026.08.09 23:05:56 LOG6[ui]: Initializing inetd mode configuration
+2026.08.09 23:05:56 LOG5[ui]: Reading configuration from file /home/sahana/Migration-Orchestrator/migration/stunnel_configs/server.conf
+2026.08.09 23:05:56 LOG5[ui]: UTF-8 byte order mark not detected
+2026.08.09 23:05:56 LOG5[ui]: FIPS mode disabled
+2026.08.09 23:05:56 LOG6[ui]: Compression enabled: 0 methods
+2026.08.09 23:05:56 LOG6[ui]: Initializing service [classical-test]
+2026.08.09 23:05:56 LOG6[ui]: OpenSSL security level is used: 2
+2026.08.09 23:05:56 LOG6[ui]: Session resumption enabled
+2026.08.09 23:05:56 LOG6[ui]: Loading certificate from file: /home/sahana/Migration-Orchestrator/migration/certs/server.crt
+2026.08.09 23:05:56 LOG6[ui]: Certificate loaded from file: /home/sahana/Migration-Orchestrator/migration/certs/server.crt
+2026.08.09 23:05:56 LOG6[ui]: Loading private key from file: /home/sahana/Migration-Orchestrator/migration/certs/server.key
+2026.08.09 23:05:56 LOG6[ui]: Private key loaded from file: /home/sahana/Migration-Orchestrator/migration/certs/server.key
+2026.08.09 23:05:56 LOG6[ui]: DH initialization skipped: no DH ciphersuites
+2026.08.09 23:05:56 LOG5[ui]: Configuration successful
+2026.08.09 23:05:56 LOG6[ui]: Service [classical-test] (FD=9) bound to 127.0.0.1:8443
+2026.08.09 23:05:56 LOG3[ui]: Cannot create pid file /var/run/stunnel4.pid
+2026.08.09 23:05:56 LOG3[ui]: create: Permission denied (13)
+2026.08.09 23:07:46 LOG6[ui]: Initializing inetd mode configuration
+2026.08.09 23:07:46 LOG5[ui]: stunnel 5.63 on x86_64-pc-linux-gnu platform
+2026.08.09 23:07:46 LOG5[ui]: Compiled with OpenSSL 3.0.2 15 Mar 2022
+2026.08.09 23:07:46 LOG5[ui]: Running  with OpenSSL 3.5.8-dev 
+2026.08.09 23:07:46 LOG5[ui]: Update OpenSSL shared libraries or rebuild stunnel
+2026.08.09 23:07:46 LOG5[ui]: Threading:PTHREAD Sockets:POLL,IPv6,SYSTEMD TLS:ENGINE,OCSP,PSK,SNI Auth:LIBWRAP
+2026.08.09 23:07:46 LOG6[ui]: Initializing inetd mode configuration
+2026.08.09 23:07:46 LOG5[ui]: Reading configuration from file /home/sahana/Migration-Orchestrator/migration/stunnel_configs/server.conf
+2026.08.09 23:07:46 LOG5[ui]: UTF-8 byte order mark not detected
+2026.08.09 23:07:46 LOG5[ui]: FIPS mode disabled
+2026.08.09 23:07:46 LOG6[ui]: Compression enabled: 0 methods
+2026.08.09 23:07:46 LOG6[ui]: Initializing service [classical-test]
+2026.08.09 23:07:46 LOG6[ui]: OpenSSL security level is used: 2
+2026.08.09 23:07:46 LOG6[ui]: Session resumption enabled
+2026.08.09 23:07:46 LOG6[ui]: Loading certificate from file: /home/sahana/Migration-Orchestrator/migration/certs/server.crt
+2026.08.09 23:07:46 LOG6[ui]: Certificate loaded from file: /home/sahana/Migration-Orchestrator/migration/certs/server.crt
+2026.08.09 23:07:46 LOG6[ui]: Loading private key from file: /home/sahana/Migration-Orchestrator/migration/certs/server.key
+2026.08.09 23:07:46 LOG6[ui]: Private key loaded from file: /home/sahana/Migration-Orchestrator/migration/certs/server.key
+2026.08.09 23:07:46 LOG6[ui]: DH initialization skipped: no DH ciphersuites
+2026.08.09 23:07:46 LOG5[ui]: Configuration successful
+2026.08.09 23:07:46 LOG6[ui]: Service [classical-test] (FD=9) bound to 127.0.0.1:8443
+2026.08.09 23:07:46 LOG6[cron]: Executing cron jobs
+2026.08.09 23:07:46 LOG6[cron]: Cron jobs completed in 0 seconds
+2026.08.09 23:07:58 LOG5[0]: Service [classical-test] accepted connection from 127.0.0.1:41568
+2026.08.09 23:07:58 LOG6[0]: Peer certificate not required
+2026.08.09 23:07:58 LOG6[0]: No peer certificate received
+2026.08.09 23:07:58 LOG6[0]: Session id: D467EC553935ADEF8F2B5896A980446C305E9A9CB4B4A0F13992EF056B947055
+2026.08.09 23:07:58 LOG6[0]: No peer certificate received
+2026.08.09 23:07:58 LOG6[0]: Session id: B5392101A2F86565816CD9C74336CCD1D665EECC5AB808BC4A935E8583D32BB8
+2026.08.09 23:07:58 LOG6[0]: TLS accepted: new session negotiated
+2026.08.09 23:07:58 LOG6[0]: TLSv1.3 ciphersuite: TLS_AES_256_GCM_SHA384 (256-bit encryption)
+2026.08.09 23:07:58 LOG6[0]: Peer temporary key: X25519, 253 bits
+2026.08.09 23:07:58 LOG6[0]: s_connect: connecting 127.0.0.1:9000
+2026.08.09 23:07:58 LOG5[0]: s_connect: connected 127.0.0.1:9000
+2026.08.09 23:07:58 LOG6[0]: persistence: 127.0.0.1:9000 cached
+2026.08.09 23:07:58 LOG5[0]: Service [classical-test] connected remote server from 127.0.0.1:35264
+2026.08.09 23:07:58 LOG6[0]: Read socket closed (read hangup)
+2026.08.09 23:07:58 LOG6[0]: SSL_shutdown successfully sent close_notify alert
+2026.08.09 23:07:58 LOG6[0]: TLS closed (SSL_read)
+2026.08.09 23:07:58 LOG5[0]: Connection closed: 882 byte(s) sent to TLS, 78 byte(s) sent to socket
+2026.08.09 23:08:23 LOG5[1]: Service [classical-test] accepted connection from 127.0.0.1:33900
+2026.08.09 23:08:23 LOG6[1]: Peer certificate not required
+2026.08.09 23:08:23 LOG6[1]: No peer certificate received
+2026.08.09 23:08:23 LOG6[1]: Session id: 46A0F7E833455475406470BA76A73D72BA2BA206B575071D6B8F65403107179C
+2026.08.09 23:08:23 LOG6[1]: No peer certificate received
+2026.08.09 23:08:23 LOG6[1]: Session id: C5AAADDF6F87D5660F7FF25D00EF06ED8CCE7821827B506BC4D89A06967F32A3
+2026.08.09 23:08:23 LOG6[1]: TLS accepted: new session negotiated
+2026.08.09 23:08:23 LOG6[1]: TLSv1.3 ciphersuite: TLS_AES_256_GCM_SHA384 (256-bit encryption)
+2026.08.09 23:08:23 LOG6[1]: Peer temporary key: X25519, 253 bits
+2026.08.09 23:08:23 LOG6[1]: s_connect: connecting 127.0.0.1:9000
+2026.08.09 23:08:23 LOG5[1]: s_connect: connected 127.0.0.1:9000
+2026.08.09 23:08:23 LOG6[1]: persistence: 127.0.0.1:9000 cached
+2026.08.09 23:08:23 LOG5[1]: Service [classical-test] connected remote server from 127.0.0.1:53652
+2026.08.09 23:08:23 LOG6[1]: TLS closed (SSL_read)
+2026.08.09 23:08:23 LOG6[1]: Read socket closed (readsocket)
+2026.08.09 23:08:23 LOG6[1]: SSL_shutdown successfully sent close_notify alert
+2026.08.09 23:08:23 LOG5[1]: Connection closed: 0 byte(s) sent to TLS, 0 byte(s) sent to socket
+2026.08.09 23:10:21 LOG3[ui]: Received SIGINT; terminating
+2026.08.09 23:10:21 LOG6[ui]: Terminating 1 service thread(s)
+2026.08.09 23:10:21 LOG6[ui]: Service threads terminated

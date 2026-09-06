@@ -1,8 +1,11 @@
 {
   "flows": [
-    {"name": "hospital_traffic", "source": "h1", "destination": "h6", "importance": "High"},
-    {"name": "banking_traffic",  "source": "h3", "destination": "h8", "importance": "High"},
-    {"name": "video_traffic",    "source": "h5", "destination": "h2", "importance": "Low"},
-    {"name": "iot_traffic",      "source": "h7", "destination": "h4", "importance": "Medium"}
+    {"name": "ctrl_s0", "source": "c0", "destination": "s0", "criticality": 0.7, "security_sla": 0.7, "latency_sla": 0.6},
+    {"name": "ctrl_s1", "source": "c0", "destination": "s1", "criticality": 0.7, "security_sla": 0.7, "latency_sla": 0.6},
+    {"name": "ctrl_s2", "source": "c0", "destination": "s2", "criticality": 0.7, "security_sla": 0.7, "latency_sla": 0.6},
+    {"name": "ctrl_s3", "source": "c0", "destination": "s3", "criticality": 0.9, "security_sla": 0.8, "latency_sla": 0.5},
+    {"name": "ctrl_s4", "source": "c0", "destination": "s4", "criticality": 0.9, "security_sla": 0.8, "latency_sla": 0.5},
+    {"name": "ctrl_s5", "source": "c0", "destination": "s5", "criticality": 0.3, "security_sla": 0.5, "latency_sla": 0.7},
+    {"name": "ctrl_s6", "source": "c0", "destination": "s6", "criticality": 0.5, "security_sla": 0.6, "latency_sla": 0.5}
   ]
 }
