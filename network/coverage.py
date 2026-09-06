@@ -1,159 +1,220 @@
 """
 coverage.py
-Feature 2: Weakest-Link Security Coverage
+Feature 2 -- Weakest-Link Security Coverage (Person A)
 
-Turns the graph + flow list from topology.py / flows_config.json into
-a single number describing how secure the network currently is.
+Pure functions only: no OS-Ken imports, no state mutation, no I/O
+beyond flows_config.json loading. Every function here takes a
+networkx.Graph and/or a flow dict and returns a value -- nothing is
+read from or written to global state. This is deliberate (guide
+section 6.2): it lets Person B unit-test optimizer.py against a
+hand-built fake graph before topology.py exists, and it lets these
+functions be called many times per optimizer round without side
+effects piling up.
 
-Person B's greedy optimizer (Feature 3) calls total_coverage()
-repeatedly, once per candidate link per round, so these functions are
-written to be cheap and side-effect free.
+CORRECTED MODEL (guide section 2.2)
+-------------------------------------
+Everywhere the original paper's Algorithm 1 says "link e", read
+"switch s". Everywhere it says "path Pf", read: "the switches that
+must be Hybrid before flow f is fully protected", computed over the
+control-plane LINK graph (topology.py's graph -- switch<->switch
+adjacency), not over host-to-host data-plane paths.
+
+    core_dpid   = the switch with the highest degree in the discovered
+                  graph (ties -> lowest dpid), recomputed every call --
+                  never hardcoded, never cached across topology changes.
+    Pf(flow)    = shortest path, over the LINK graph, from the flow's
+                  destination_dpid to core_dpid.
+    Lf(flow)    = the subset of Pf(flow) still in "Legacy" state.
+    weight(f)   = 0.5*criticality + 0.3*security_sla + 0.2*latency_sla
+    security(f) = min(state(s) for s in Pf(f))      Legacy=0, Hybrid=1
+    C           = sum(weight(f) * security(f) for f in F)
+
+Interface frozen by the guide, section 5.3 (this is what optimizer.py,
+Person B, is written against -- do not rename these):
+    compute_coverage(G, flows)                              -> float
+    compute_path(G, flow)                                   -> list[str]
+    compute_legacy_set(G, flow)                              -> set[str]
+    compute_gain(G, flows, hypothetical_migrated: set[str])  -> dict[str, float]
 """
 
 import json
+
 import networkx as nx
-
-# Legacy = classical TLS only, Hybrid = classical + PQC
-SECURITY_LEVEL = {"Legacy": 0, "Hybrid": 1}
-
-# Legacy categorical weight mapping -- kept for flows_config.json files
-# that only specify "importance": "High"/"Medium"/"Low". Superseded by
-# flow_weight() below when a flow specifies the multi-factor fields.
-IMPORTANCE_WEIGHT = {"High": 3, "Medium": 2, "Low": 1}
-
-# Feature 4.2: Business-Aware Flow Weighting (SAW -- Simple Additive
-# Weighting). weight(flow) = w_c*criticality + w_s*security_sla +
-# w_l*latency_sla, each factor already normalized to 0-1 by whoever
-# populates flows_config.json. Weights must sum to 1. These particular
-# values (criticality dominant, security SLA next, latency SLA least)
-# are a starting judgment call, not derived -- if that needs defending
-# to stakeholders, re-derive them with AHP (pairwise comparisons) or
-# CRITIC (data-driven) instead of hand-picking.
-SAW_WEIGHTS = {"criticality": 0.5, "security_sla": 0.3, "latency_sla": 0.2}
 
 
 def load_flows(path):
     """
-    Load the flow list written by Feature 1, and precompute each
-    flow's weight (Feature 4.2) once up front so downstream code
-    (total_coverage, the optimizer) reads flow["weight"] directly
-    instead of re-deriving it from raw fields every call.
+    Load the flow list from flows_config.json. Each flow must carry
+    "destination_dpid" (section 5.2) plus the three SAW factors.
+    "source"/"destination" (human labels like "c0"/"s3") are kept in
+    the file for documentation only -- nothing here reads them.
     """
     with open(path, "r") as f:
         data = json.load(f)
-    flows = data["flows"]
-    for flow in flows:
-        flow["weight"] = flow_weight(flow)
-    return flows
+    return data["flows"]
+
+
+def core_switch(G):
+    """
+    The switch with the highest node degree in the CURRENT graph.
+    Recomputed on every call -- this is what makes the whole model
+    topology-agnostic: swap topo.py for a different shape and every
+    downstream computation adjusts automatically, no code changes.
+
+    Ties resolve to the lowest dpid, deterministically, so repeated
+    calls against an unchanged graph always agree.
+    """
+    if len(G) == 0:
+        return None
+    return max(G.nodes, key=lambda n: (G.degree[n], -int(n, 16)))
+
+
+def compute_path(G, flow):
+    """
+    Pf for a flow: shortest path, over the LINK graph G, from the
+    flow's anchor switch (destination_dpid) to the current core
+    switch. Returns a list of dpids, core-ward, inclusive of both
+    endpoints.
+
+    If the graph is empty or the flow's switch hasn't been discovered
+    yet (e.g. queried before OS-Ken has seen it), fail soft: return
+    just the destination dpid on its own rather than raising, so a
+    caller doing a coverage sweep over many flows doesn't crash on one
+    not-yet-seen switch.
+    """
+    core = core_switch(G)
+    dst = flow["destination_dpid"]
+    if core is None or dst not in G:
+        return [dst] if dst else []
+    return nx.shortest_path(G, source=dst, target=core)
+
+
+def compute_legacy_set(G, flow):
+    """Lf: the subset of Pf(flow) that is still in the Legacy state."""
+    return {s for s in compute_path(G, flow) if G.nodes[s]["state"] == "Legacy"}
 
 
 def flow_weight(flow):
-    """
-    Compute weight(flow) per Feature 4.2. Two supported formats:
-
-      - Multi-factor (SAW): flow has "criticality", "security_sla",
-        and "latency_sla", each already normalized to 0-1. Weight is
-        the SAW_WEIGHTS-weighted sum of the three.
-      - Legacy categorical: flow has "importance": "High"/"Medium"/
-        "Low". Falls back to IMPORTANCE_WEIGHT, for flows_config.json
-        files written before Feature 4.2.
-
-    Raises ValueError if a flow has neither -- silently defaulting to
-    0 would make that flow invisible to total_coverage without any
-    signal that its weight fields are missing.
-    """
-    if all(k in flow for k in ("criticality", "security_sla", "latency_sla")):
-        return (
-            SAW_WEIGHTS["criticality"] * flow["criticality"]
-            + SAW_WEIGHTS["security_sla"] * flow["security_sla"]
-            + SAW_WEIGHTS["latency_sla"] * flow["latency_sla"]
-        )
-    if "importance" in flow:
-        return IMPORTANCE_WEIGHT[flow["importance"]]
-    raise ValueError(
-        f"flow has neither criticality/security_sla/latency_sla nor "
-        f"importance -- cannot compute weight: {flow}"
+    """weight(f) = 0.5*criticality + 0.3*security_sla + 0.2*latency_sla."""
+    return (
+        0.5 * flow["criticality"]
+        + 0.3 * flow["security_sla"]
+        + 0.2 * flow["latency_sla"]
     )
 
 
-def get_path_links(graph, source, destination):
+def flow_security(G, flow):
     """
-    Return the path between source and destination as a list of
-    (a, b) edge tuples. Shortest path is a reasonable, defensible
-    simplification for this beginner scope.
+    security(f): the weakest-link score for flow f's current path --
+    1.0 only if every switch on Pf(f) is Hybrid, else 0.0. Not an
+    average, not a fraction of links migrated.
     """
-    node_path = nx.shortest_path(graph, source, destination)
-    return list(zip(node_path[:-1], node_path[1:]))
+    path = compute_path(G, flow)
+    if not path:
+        return 0.0
+    return min(1.0 if G.nodes[s]["state"] == "Hybrid" else 0.0 for s in path)
 
 
-def path_security_level(graph, path_links):
-    """
-    The weakest-link score for one path: the MINIMUM security level
-    among all links on that path, not the average and not a count of
-    how many links are upgraded.
-    """
-    if not path_links:
-        return 0
-    levels = []
-    for a, b in path_links:
-        state = graph.edges[a, b]["state"]
-        levels.append(SECURITY_LEVEL[state])
-    return min(levels)
+def compute_coverage(G, flows):
+    """C = sum(weight(f) * security(f) for f in flows). The single
+    number the greedy optimizer (Person B) tries to maximize."""
+    return sum(flow_weight(f) * flow_security(G, f) for f in flows)
 
 
-def total_coverage(graph, flows):
+def compute_gain(G, flows, hypothetical_migrated):
     """
-    Sum, across every flow, of: weight(flow) x weakest_link_score
-    (flow's path). This is the single number Feature 3 tries to
-    maximize by choosing which link to upgrade next.
+    Per-flow marginal coverage gain if every dpid in
+    hypothetical_migrated were (hypothetically) flipped to Hybrid,
+    holding everything else fixed. Does not mutate G -- works on a
+    copy, then throws it away.
 
-    Uses flow["weight"] if load_flows already precomputed it;
-    otherwise calls flow_weight(flow) directly, so this also works on
-    flow lists built by hand (e.g. in tests) rather than only ones
-    loaded from flows_config.json.
+    Returns {flow_name: gain}, so the optimizer can score a batch of
+    candidate flows in one call instead of recomputing total coverage
+    once per candidate.
     """
-    score = 0
-    for flow in flows:
-        path_links = get_path_links(graph, flow["source"], flow["destination"])
-        level = path_security_level(graph, path_links)
-        weight = flow["weight"] if "weight" in flow else flow_weight(flow)
-        score += weight * level
-    return score
+    G2 = G.copy()
+    for dpid in hypothetical_migrated:
+        if dpid in G2:
+            G2.nodes[dpid]["state"] = "Hybrid"
+
+    gains = {}
+    for f in flows:
+        path = compute_path(G, f)  # path itself doesn't change hypothetically
+        after = flow_weight(f) * (
+            1.0 if all(G2.nodes[s]["state"] == "Hybrid" for s in path) else 0.0
+        )
+        before = flow_weight(f) * flow_security(G, f)
+        gains[f["name"]] = after - before
+    return gains
 
 
 if __name__ == "__main__":
-    # self-test against the real project topology (matches topo.py)
-    from topology import build_graph, PROJECT_TOPO
-    graph = build_graph(PROJECT_TOPO)
-    flows = load_flows("flows_config.json")
-    # Sanity check: with the triangle in place, hospital_traffic's
-    # shortest path (h1 -> h6) should use the s1-s2 cross-link, not
-    # detour through the core switch s0.
-    hospital_path = get_path_links(graph, "h1", "h6")
-    print("hospital_traffic path:", hospital_path)
-    assert ("s1", "s2") in hospital_path or ("s2", "s1") in hospital_path
-    print("All links Legacy -> total coverage =", total_coverage(graph, flows))
-    # every path's weakest link is Legacy (0), so score must be 0
-    assert total_coverage(graph, flows) == 0
-    # upgrade only the backbone (agg<->core, and the cross-link) -- every
-    # flow crosses agg-A/agg-B, so ALL of them still fail on their
-    # unmigrated edge/host-facing hop
-    for a, b in [("s1", "s0"), ("s2", "s0"), ("s1", "s2")]:
-        graph.edges[a, b]["state"] = "Hybrid"
-    print("Backbone-only Hybrid -> total coverage =", total_coverage(graph, flows))
-    assert total_coverage(graph, flows) == 0
-    # now fully upgrade hospital_traffic's actual path (h1-s3-s1-s2-s5-h6)
-    for a, b in [("h1", "s3"), ("s3", "s1"), ("s5", "s2"), ("s5", "h6")]:
-        if graph.has_edge(a, b):
-            graph.edges[a, b]["state"] = "Hybrid"
-    print("hospital path fully Hybrid -> total coverage =", total_coverage(graph, flows))
-    # hospital_traffic weight 3 x level 1 = 3; others still 0
-    assert total_coverage(graph, flows) == 3
-    print("All self-checks passed.")
+    # --------------------------------------------------------------
+    # Self-test against a HAND-BUILT graph, not topo.py and not any
+    # hardcoded PROJECT_TOPO dict. This is exactly the "test against a
+    # fake graph" workflow the guide recommends in section 10, step 1:
+    # coverage.py needs nothing but networkx, so this runs standalone,
+    # before topology.py is ever wired to a live OS-Ken session.
+    #
+    # The shape mirrors topo.py's real switch-to-switch links, but
+    # note this dict lives ONLY inside this __main__ test block -- it
+    # is not imported by, or hardcoded into, any function above.
+    # --------------------------------------------------------------
+    def _fake_graph():
+        G = nx.Graph()
+        dpids = [f"{i:016x}" for i in range(7)]  # s0..s6 -> 0000...00 .. 0000...06
+        for d in dpids:
+            G.add_node(d, state="Legacy")
+        s0, s1, s2, s3, s4, s5, s6 = dpids
+        G.add_edge(s1, s0)
+        G.add_edge(s2, s0)
+        G.add_edge(s1, s2)   # redundant agg-to-agg cross-link
+        G.add_edge(s3, s1)
+        G.add_edge(s4, s1)
+        G.add_edge(s5, s2)
+        G.add_edge(s6, s2)
+        return G, dict(s0=s0, s1=s1, s2=s2, s3=s3, s4=s4, s5=s5, s6=s6)
 
-    # Feature 4.2 self-check: multi-factor SAW weighting, independent
-    # of flows_config.json's categorical flows above.
-    saw_flow = {"criticality": 1.0, "security_sla": 1.0, "latency_sla": 0.0}
-    expected = SAW_WEIGHTS["criticality"] * 1.0 + SAW_WEIGHTS["security_sla"] * 1.0
-    assert flow_weight(saw_flow) == expected
-    print(f"SAW weight check passed: {saw_flow} -> {flow_weight(saw_flow)}")
+    G, name = _fake_graph()
+
+    # core switch check: s1 and s2 tie on degree 4; lowest dpid wins -> s1
+    core = core_switch(G)
+    print("core switch:", core)
+    assert core == name["s1"]
+
+    flows = [
+        {"name": "ctrl_s3", "destination_dpid": name["s3"],
+         "criticality": 0.9, "security_sla": 0.8, "latency_sla": 0.5},
+        {"name": "ctrl_s5", "destination_dpid": name["s5"],
+         "criticality": 0.3, "security_sla": 0.5, "latency_sla": 0.7},
+    ]
+
+    # Pf(ctrl_s3) should be s3 -> s1 (already at core, 1 hop)
+    p3 = compute_path(G, flows[0])
+    print("Pf(ctrl_s3):", p3)
+    assert p3 == [name["s3"], name["s1"]]
+
+    # Pf(ctrl_s5) should be s5 -> s2 -> s1 (2 hops to reach the core)
+    p5 = compute_path(G, flows[1])
+    print("Pf(ctrl_s5):", p5)
+    assert p5 == [name["s5"], name["s2"], name["s1"]]
+
+    print("All-Legacy coverage:", compute_coverage(G, flows))
+    assert compute_coverage(G, flows) == 0.0
+
+    # Migrate every switch on ctrl_s3's path -> only ctrl_s3 becomes secure
+    for s in compute_legacy_set(G, flows[0]):
+        G.nodes[s]["state"] = "Hybrid"
+    cov = compute_coverage(G, flows)
+    print("After migrating ctrl_s3's path:", cov)
+    assert abs(cov - flow_weight(flows[0])) < 1e-9
+
+    # compute_gain sanity check: migrating the rest of ctrl_s5's path
+    # should show a positive gain exactly equal to ctrl_s5's weight
+    remaining = compute_legacy_set(G, flows[1])
+    gains = compute_gain(G, flows, remaining)
+    print("Hypothetical gains:", gains)
+    assert abs(gains["ctrl_s5"] - flow_weight(flows[1])) < 1e-9
+    assert gains["ctrl_s3"] == 0.0  # already fully migrated, no further gain
+
+    print("All coverage.py self-checks passed (no topo.py or OS-Ken required).")
