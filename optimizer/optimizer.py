@@ -13,8 +13,52 @@ lives on graph NODES, not edges:
     Lf(flow)  = the subset of Pf(flow) still in "Legacy" state
     w(f)      = 0.5*criticality + 0.3*security_sla + 0.2*latency_sla
     C         = sum(w(f) * security(f) for f in flows)
-    score(f)  = gain(f) / cost(Lf(f)) ** 0.5           (Alg. 1, line 11)
-    progress(s) = (sum(w(f)/len(Lf(f)) for f in F if s in Lf(f))) / cost(s) ** 0.5
+
+LITERATURE-BACKED REFORMULATION (see SGBM_Literature_Backed_Formulation.docx,
+sections 5.3 and 6.1 -- supersedes the earlier invented constants)
+----------------------------------------------------------------------------
+Two numbers used by this module were previously unsourced and have been
+replaced:
+
+  score(f) = gain(f) / cost(Lf(f))^alpha,  alpha = 1  (Sec. 6.1, Alg. 1 line 11)
+      Plain gain/cost (alpha=1), not alpha=0.5. This is the exact
+      cost-effectiveness greedy rule proven to reach 1/2*(1-1/e) on a
+      single knapsack constraint over a coverage-type objective
+      [Khuller, Moss, Naor, "The Budgeted Maximum Coverage Problem",
+      IPL 70(1), 1999], and used identically (also alpha=1) in CELF
+      [Leskovec et al., KDD 2007]. alpha=0.5 had no citation and is
+      withdrawn.
+
+  progress(s) = [sum(w(f)/len(Lf(f)) for f in F if s in Lf(f))] / cost(s)^alpha,
+      alpha = 1 (Sec. 6.2, Alg. 1 lines 18-24, fallback branch)
+      Same alpha as 6.1 for consistency. Note (stated in the doc,
+      Sec. 6.2): this fallback is a heuristic proxy for true marginal
+      gain, so the 6.1 guarantee does not automatically transfer to it;
+      it remains empirically validated only (Table I / Fig. 2), not
+      proven.
+
+  sgbm_approx_ratio(G, flows) = 1 - e^(-1/(d+1))  (Sec. 5.2-5.3)
+      The structural bound for a monotone supermodular function with
+      supermodular degree d under a cardinality-style constraint
+      [Feldman & Izsak, "Constrained Monotone Function Maximization and
+      the Supermodular Degree", APPROX/RANDOM 2014, arXiv:1407.6328;
+      improves the 1/(d+1) bound of Feige & Izsak, ITCS 2013]. The
+      previously used rho = 1/(2*(d+1)+1) had no source and is
+      withdrawn. d itself is also corrected here to the
+      Feige-Izsak/Feldman-Izsak definition -- the union of per-flow
+      path dependencies at a switch, not just the single longest flow
+      path (see supermodular_degree() below).
+
+      Stated scope limitation (Sec. 5.3, carried through here rather
+      than hidden): this ratio is proved for a cardinality/
+      k-extendible-system constraint, not SGBM's heterogeneous
+      per-switch budget B. A knapsack-tight bound for this AND
+      (weakest-link) objective is, to our knowledge, open in the
+      literature -- curvature/submodularity-ratio machinery degenerates
+      here because f({s}) = 0 for any switch that does not by itself
+      complete a flow's path. The budget-constrained regime is instead
+      validated empirically (Table I / Fig. 2), which is the documented
+      stand-in for the missing knapsack-tight proof.
 
 This is a rewrite of a stale pre-correction draft that imported
 `total_coverage` / `get_path_links` from coverage.py and read/wrote
@@ -46,6 +90,7 @@ Interface (guide section 7.2, frozen):
          "baseline": {...}, "post": {...} | None, "timestamp": iso8601 str}
 """
 
+import math
 import os
 import sys
 
@@ -65,6 +110,12 @@ from coverage import (  # noqa: E402
 )
 from capability_tracker import CapabilityTracker  # noqa: E402
 
+# alpha for score(f) and progress(s), Sec. 6.1/6.2 of
+# SGBM_Literature_Backed_Formulation.docx. alpha=1 is the value with a
+# citation (Khuller-Moss-Naor / CELF); change only with a matching
+# citation, and update the module docstring above if you do.
+SCORE_ALPHA = 1
+
 
 # ---------------------------------------------------------------------
 # Shared helpers
@@ -77,30 +128,53 @@ def get_legacy_switches(G):
 
 def supermodular_degree(G, flows):
     """
-    Measured D+ for this topology + flow set: the largest number of
-    OTHER switches any single switch shares a flow's path with, i.e.
-    max(|Pf| - 1) over every flow (Algorithm 1, line 2). Report the
-    MEASURED value for the actual topology in use -- per the guide's
-    honesty note (section 2.2/12), this testbed's path lengths are
-    small (2-3 hops for most flows), so don't quote the paper's
-    abstract worst-case bound as if it were achieved here.
+    Measured supermodular degree d for this topology + flow set, per
+    the Feige-Izsak / Feldman-Izsak definition (reformulation doc,
+    Sec. 5.2):
+
+        d = max_{s in V} | union_{f : s in Pf(f)} (Pf(f) \\ {s}) |
+
+    i.e. for each switch s, take the union (not the max) of every
+    flow-path-minus-s across every flow whose path includes s, then
+    take the largest such set over all switches. This corrects the
+    earlier max_f(|Pf|-1) definition, which undercounts whenever a
+    switch lies on more than one flow's path -- the normal case here,
+    since every Pf terminates at the shared core switch.
     """
-    d = 0
+    deps = {}
     for f in flows:
         path = compute_path(G, f)
-        d = max(d, max(len(path) - 1, 0))
-    return d
+        path_set = set(path)
+        for s in path:
+            deps.setdefault(s, set()).update(path_set - {s})
+    if not deps:
+        return 0
+    return max(len(dep_set) for dep_set in deps.values())
 
 
 def sgbm_approx_ratio(G, flows):
     """
-    Approximation ratio 1/(2*(D+ + 1) + 1) for the measured
-    supermodular degree (Algorithm 1, line 3) -- a real but weaker
-    guarantee than the classic 1-1/e submodular bound, since
-    weakest-link coverage is supermodular, not submodular.
+    Structural approximation ratio for SGBM's batch-selection branch,
+    per the reformulation doc Sec. 5.3:
+
+        rho_struct = 1 - e^(-1/(d+1))
+
+    [Feldman & Izsak, APPROX/RANDOM 2014 (arXiv:1407.6328), improving
+    the 1/(d+1) bound of Feige & Izsak, ITCS 2013], for a monotone
+    supermodular objective with supermodular degree d under a
+    cardinality-style constraint.
+
+    Scope limitation (stated, not hidden): this is proved for a
+    cardinality/k-extendible-system constraint, not SGBM's
+    heterogeneous per-switch budget B -- report it as the structural
+    guarantee under the idealized near-uniform-cost case, and rely on
+    the empirical budget-constrained comparison (Table I / Fig. 2) for
+    the general-cost regime, since a knapsack-tight bound for this
+    AND/weakest-link objective is, to our knowledge, open in the
+    literature (see module docstring).
     """
-    d_plus = supermodular_degree(G, flows)
-    return 1.0 / (2 * (d_plus + 1) + 1)
+    d = supermodular_degree(G, flows)
+    return 1.0 - math.exp(-1.0 / (d + 1))
 
 
 # ---------------------------------------------------------------------
@@ -128,7 +202,9 @@ def pick_best_batch(G, flows, budget, capability):
     """
     Among every flow whose full remaining-Legacy batch fits in
     `budget`, return the one with the highest
-    score(f) = gain(f) / cost(Lf(f)) ** 0.5   (Algorithm 1, lines 10-12).
+    score(f) = gain(f) / cost(Lf(f)) ** SCORE_ALPHA   (Algorithm 1,
+    lines 10-12; SCORE_ALPHA=1 per reformulation doc Sec. 6.1 --
+    plain gain/cost, citing Khuller-Moss-Naor / CELF).
 
     gain(f) is computed via a single compute_gain() call over the
     union of every candidate's Lf, so this makes exactly one coverage
@@ -148,7 +224,7 @@ def pick_best_batch(G, flows, budget, capability):
 
     def score(candidate):
         f, _Lf, cost_Lf = candidate
-        return gains.get(f["name"], 0.0) / (cost_Lf ** 0.5)
+        return gains.get(f["name"], 0.0) / (cost_Lf ** SCORE_ALPHA)
 
     best_f, best_Lf, best_cost = max(candidates, key=score)
     return best_f, best_Lf, best_cost, gains.get(best_f["name"], 0.0)
@@ -159,10 +235,17 @@ def _pick_progress_switch(G, flows, budget, capability):
     Fallback for when no flow's full batch fits the remaining budget
     (Algorithm 1, lines 18-24): pick the single affordable Legacy
     switch with the highest
-        progress(s) = (sum(w(f)/len(Lf(f)) for f in F if s in Lf(f))) / cost(s) ** 0.5
-    i.e. partial credit toward every path `s` still blocks, so
-    leftover budget still moves the network toward completing its
+        progress(s) = (sum(w(f)/len(Lf(f)) for f in F if s in Lf(f)))
+                      / cost(s) ** SCORE_ALPHA
+    (SCORE_ALPHA=1, same as 6.1 for consistency -- reformulation doc
+    Sec. 6.2), i.e. partial credit toward every path `s` still blocks,
+    so leftover budget still moves the network toward completing its
     highest-value paths instead of being wasted or left unspent.
+
+    Stated limitation (Sec. 6.2): this is a heuristic proxy for true
+    marginal gain, not the argmax of gain/cost itself, so the 6.1
+    cost-effectiveness guarantee does not automatically transfer to
+    this branch -- it is validated empirically only.
 
     Returns (dpid, progress_score), or None if no Legacy switch fits
     within `budget`.
@@ -181,7 +264,7 @@ def _pick_progress_switch(G, flows, budget, capability):
             contribution[s] = contribution.get(s, 0.0) + share
 
     def progress(s):
-        return contribution.get(s, 0.0) / (capability.cost(s) ** 0.5)
+        return contribution.get(s, 0.0) / (capability.cost(s) ** SCORE_ALPHA)
 
     best = max(affordable, key=progress)
     return best, progress(best)
@@ -366,8 +449,8 @@ if __name__ == "__main__":
 
     d_plus = supermodular_degree(G, flows)
     ratio = sgbm_approx_ratio(G, flows)
-    print(f"Measured supermodular degree D+ = {d_plus}")
-    print(f"SGBM approximation ratio: 1/(2*({d_plus}+1)+1) = {ratio:.3f}")
+    print(f"Measured supermodular degree d = {d_plus}")
+    print(f"SGBM structural approximation ratio: 1 - e^(-1/({d_plus}+1)) = {ratio:.3f}")
 
     tracker = CapabilityTracker()
     schedule, final_coverage = run_sgbm(

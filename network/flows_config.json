@@ -5,63 +5,91 @@
       "source": "c0",
       "destination": "s0",
       "destination_dpid": "0000000000000010",
-      "criticality": 0.7,
-      "security_sla": 0.7,
-      "latency_sla": 0.6
+      "bandwidth_mbps": 10,
+      "impact_confidentiality": "Moderate",
+      "impact_integrity": "Moderate",
+      "impact_availability": "Moderate",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 40,
+      "measured_delay_ms": 35
     },
     {
       "name": "ctrl_s1",
       "source": "c0",
       "destination": "s1",
       "destination_dpid": "0000000000000001",
-      "criticality": 0.7,
-      "security_sla": 0.7,
-      "latency_sla": 0.6
+      "bandwidth_mbps": 10,
+      "impact_confidentiality": "Moderate",
+      "impact_integrity": "Moderate",
+      "impact_availability": "Moderate",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 40,
+      "measured_delay_ms": 35
     },
     {
       "name": "ctrl_s2",
       "source": "c0",
       "destination": "s2",
       "destination_dpid": "0000000000000002",
-      "criticality": 0.7,
-      "security_sla": 0.7,
-      "latency_sla": 0.6
+      "bandwidth_mbps": 10,
+      "impact_confidentiality": "Moderate",
+      "impact_integrity": "Moderate",
+      "impact_availability": "Moderate",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 40,
+      "measured_delay_ms": 35
     },
     {
       "name": "ctrl_s3",
       "source": "c0",
       "destination": "s3",
       "destination_dpid": "0000000000000003",
-      "criticality": 0.9,
-      "security_sla": 0.8,
-      "latency_sla": 0.5
+      "bandwidth_mbps": 25,
+      "impact_confidentiality": "High",
+      "impact_integrity": "High",
+      "impact_availability": "Moderate",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 15,
+      "measured_delay_ms": 12
     },
     {
       "name": "ctrl_s4",
       "source": "c0",
       "destination": "s4",
       "destination_dpid": "0000000000000004",
-      "criticality": 0.9,
-      "security_sla": 0.8,
-      "latency_sla": 0.5
+      "bandwidth_mbps": 25,
+      "impact_confidentiality": "High",
+      "impact_integrity": "High",
+      "impact_availability": "Moderate",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 15,
+      "measured_delay_ms": 12
     },
     {
       "name": "ctrl_s5",
       "source": "c0",
       "destination": "s5",
       "destination_dpid": "0000000000000005",
-      "criticality": 0.3,
-      "security_sla": 0.5,
-      "latency_sla": 0.7
+      "bandwidth_mbps": 5,
+      "impact_confidentiality": "Low",
+      "impact_integrity": "Low",
+      "impact_availability": "Low",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 60,
+      "measured_delay_ms": 55
     },
     {
       "name": "ctrl_s6",
       "source": "c0",
       "destination": "s6",
       "destination_dpid": "0000000000000006",
-      "criticality": 0.5,
-      "security_sla": 0.6,
-      "latency_sla": 0.5
+      "bandwidth_mbps": 8,
+      "impact_confidentiality": "Low",
+      "impact_integrity": "Moderate",
+      "impact_availability": "Low",
+      "traffic_class": "delay_sensitive",
+      "q_delay_ms": 45,
+      "measured_delay_ms": 40
     }
   ]
 }
