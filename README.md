@@ -87,4 +87,4 @@ Control-plane graph + weakest-link coverage math	Person A	network/topology.py, n
 Greedy migration selection (SGBM)	Person B	optimizer/optimizer.py, optimizer/capability_tracker.py
 Mininet topology, Guarded Migration Execution	Person C	network/topo.py, migration/migrate_link.py
 Degradation monitoring, rollback, audit ledger	Person D	monitor.py, ledger.py
-See QSMO_Implementation_Guide.docx for the full spec this repo implements against.
+See QSMO_Implementation_Guide.docx for the full spec this repo implements against.****
