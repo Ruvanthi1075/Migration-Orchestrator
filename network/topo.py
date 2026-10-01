@@ -110,13 +110,33 @@ def build():
                        ip=CONTROLLER_IP, port=CONTROLLER_PORT)
 
     info('*** Adding switches (core / aggregation / edge) with STP enabled\n')
-    s0 = net.addSwitch('s0', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # core
-    s1 = net.addSwitch('s1', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # agg-A
-    s2 = net.addSwitch('s2', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # agg-B
-    s3 = net.addSwitch('s3', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # edge - hospital
-    s4 = net.addSwitch('s4', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # edge - banking
-    s5 = net.addSwitch('s5', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # edge - video
-    s6 = net.addSwitch('s6', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True)  # edge - iot
+    # Explicit dpid= on every switch (guide sections 5.2 / 8.5).
+    #
+    # Mininet's implicit dpid assignment (no dpid= given) is stable for
+    # s1-s6 -- they land on 1-6 as expected -- but NOT for s0: OVS treats
+    # an all-zero datapath-id (0000000000000000) as "unset" and silently
+    # auto-generates its own random one instead, which is not guaranteed
+    # to stay the same across reboots or `mn -c` resets. So s0 gets
+    # '...0010' here (an explicit, deliberately non-zero value) instead
+    # of the '...0000' it would otherwise fall back to.
+    #
+    # These values are exactly what flows_config.json's destination_dpid
+    # fields expect (Person A, guide 5.2) -- confirmed with Person A;
+    # if these ever change, flows_config.json must be updated to match.
+    s0 = net.addSwitch('s0', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000010')  # core
+    s1 = net.addSwitch('s1', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000001')  # agg-A
+    s2 = net.addSwitch('s2', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000002')  # agg-B
+    s3 = net.addSwitch('s3', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000003')  # edge - hospital
+    s4 = net.addSwitch('s4', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000004')  # edge - banking
+    s5 = net.addSwitch('s5', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000005')  # edge - video
+    s6 = net.addSwitch('s6', cls=OVSKernelSwitch, protocols='OpenFlow13', stp=True,
+                        dpid='0000000000000006')  # edge - iot
     switches = {'s0': s0, 's1': s1, 's2': s2, 's3': s3, 's4': s4, 's5': s5, 's6': s6}
 
     info('*** Adding hosts (flat 10.0.0.0/24 subnet)\n')
