@@ -87,104 +87,58 @@ D3 -- Why not just test if native OVS TLS happens to negotiate PQC:
     pursued per guide §8.2's explicit instruction not to spend Feature
     4 time here unless §8 is fully working with time left over.
 
-MAKE-BEFORE-BREAK MIGRATION PROTOCOL (supersedes the original
-Stage-2 "flip the controller target and poll" cutover)
+D4 -- Why Break-Before-Make and not Make-Before-Break:
+    An earlier design configured Legacy + Hybrid as two parallel OVS
+    controllers and probed the Hybrid path with a synthetic OpenFlow
+    peer. Live testing showed that two simultaneous sessions for the
+    SAME real DPID make OS-Ken/Ryu treat the newer one as a replacement
+    and evict the other, and a synthetic probe presenting a fake DPID
+    is itself a second OpenFlow session toward OS-Ken. That design was
+    abandoned. The current protocol never has two controllers
+    configured at once and never opens a synthetic OpenFlow connection.
+
+BREAK-BEFORE-MAKE MIGRATION PROTOCOL
 --------------------------------------------------------------------------
-The original Guarded Migration Execution cutover was direct: attempt
-the Hybrid handshake, and on success, immediately repoint OVS's
-controller target at it (Algorithm 2 lines 6-11). That never gave a
-window to notice a handshake that *succeeds* but doesn't actually carry
-working control traffic -- a real, documented OQS/OpenSSL
-provider-compatibility failure mode (clean TLS, broken data path).
+  Stage 1 (non-disruptive pre-flight): measure the Legacy baseline,
+    bring up the shared stunnel server and this switch's stunnel
+    client, and confirm a real X25519MLKEM768 handshake completed
+    through the client. OVS's controller target is never touched, so a
+    Stage 1 failure leaves the switch exactly as it was.
 
-The protocol below never modifies the live Legacy session until a
-replacement connection has been independently proven to work, under
-real load, for a sustained window -- not just at the instant of the
-handshake:
+  Stage 2 (Break-Before-Make cutover):
+    BREAK   ovs-vsctl set-controller <switch> <hybrid_target>
+            (ONE target: the Legacy controller is removed first)
+    WAIT    poll OVS itself until the Controller row for that exact
+            target reports is_connected=true (or time out)
+    VERIFY  take `verification_health_checks` (N) samples spread so
+            the first is at t=0 and the last at t=T
+            (`verification_window_s`); each re-checks is_connected on
+            the same OVS Controller row (one short retry absorbs an
+            OVSDB reporting race), and optionally runs
+            `data_plane_check_fn`
+    FAIL    any failed gate -> ovs-vsctl set-controller <switch>
+            <legacy_target> (Legacy-only rollback)
+    PASS    capture post metrics from the real OVS connection, then
+            topology.set_state(dpid, "Hybrid")
 
-  MAKE (non-disruptive):
-    Add the Hybrid target as a SECOND, PARALLEL controller alongside
-    the switch's existing Legacy controller, in one ovsdb transaction:
-        ovs-vsctl set-controller <switch> <legacy_target> <new_target>
-    OVS now maintains BOTH connections simultaneously. No renegotiation
-    of the Legacy session's crypto suite is attempted, and the Legacy
-    connection keeps carrying every bit of live OpenFlow traffic,
-    completely unmodified, for the entire MAKE + VERIFY phase below.
-
-  VERIFY (the actual guard against the failure mode above):
-    Over a fixed verification window of `verification_window_s`
-    seconds (T), take `verification_health_checks` samples (N). Each
-    sample:
-      (a) re-confirms the NEW controller target's own is_connected
-          state (catches a connection that flaps rather than staying
-          up under sustained real traffic), and
-      (b) opens a SEPARATE, synthetic probe connection through the
-          SAME local stunnel client port (see _OpenFlowHealthProbe
-          below) and runs a real OpenFlow 1.3 HELLO -> Echo
-          Request/Reply exchange, answers a Features Request if the
-          controller sends one, and watches for a Flow-Mod. This
-          probe is deliberately a THIRD, disposable connection -- it
-          never touches OVS's own two live sessions -- so a failed
-          probe can never disrupt the switch's actual control traffic;
-          it only tells us whether *this tunnel path* is carrying
-          working OpenFlow bytes, not just a valid TLS handshake.
-    Any failed sample -- is_connected flapping, a probe that can't
-    connect, a HELLO/Echo that doesn't come back -- aborts immediately:
-    the new target is dropped (single revert-to-legacy-only call) and
-    the Legacy session, never having been touched, keeps running.
-
-  BREAK (atomic cutover + grace-close):
-    Only once every VERIFY sample has passed (and, if
-    `require_flow_mod_confirmation` is True -- the default -- at least
-    one sample observed a real Flow-Mod round trip) does this method
-    issue the single ovsdb transaction that replaces the controller
-    set with the NEW target alone:
-        ovs-vsctl set-controller <switch> <new_target>
-    OVS's controller-set model has no partial/staged way to drop one
-    controller out of a multi-controller set -- there is no separate
-    "mark primary" step and "close old connection" step to sequence,
-    it is one atomic database write. That single write is therefore
-    simultaneously this protocol's "atomic cutover... designates the
-    new connection as primary" step AND its "grace-close the old
-    connection only after a flow-mod round trip succeeds" step: by the
-    time this call runs, the flow-mod gate has already been satisfied,
-    so the old connection's removal is never premature.
-
-  Failure at any point in MAKE or VERIFY leaves the switch on
-  Legacy-only, exactly as before Stage 1 ever ran.
-
-Honesty notes on what this protocol can and cannot verify from this
-module's vantage point alone (state this plainly in the report, guide
-§12's convention):
-  - True OpenFlow ROLE (master/slave) negotiation is NOT exercised --
-    that requires the CONTROLLER side to issue an OFPT_ROLE_REQUEST,
-    which is Person A/D's controller-app code, not something
-    migrate_link.py can drive from the switch/OVS side. "Designates
-    the new connection as primary" is realized here as OVS's
-    controller-SET containing only the new target after BREAK, which
-    is the closest equivalent achievable without controller-app
-    changes, and is stated as such rather than implied to be a real
-    role handoff.
-  - The Flow-Mod check is inherently best-effort: it depends on the
-    controller app proactively pushing a flow-mod on switch-connect
-    (e.g. simple_l2_switch.py installing a table-miss rule). If your
-    controller app is purely reactive and never does this, set
-    require_flow_mod_confirmation=False -- but say so explicitly in
-    the report rather than silently weakening the gate.
-  - The verification window adds latency and control-plane overhead
-    (guide addendum's own stated limitation) before a migration
-    commits. This is not yet quantified against Fig. 3's plain
-    handshake-latency comparison; report `verification_window_s`
-    (T) x number of migrated switches as the added wall-clock cost
-    per run when writing this up.
-  - The "data-plane check" referenced by the migration protocol
-    (its own "Section 4") is NOT implemented here -- that section
-    wasn't available when this file was written, and it wasn't in
-    scope to guess its check that it describes. `data_plane_check_fn`
-    below is a documented extension point for whoever owns that
-    check to wire in for real; until it is, the verification window
-    runs WITHOUT it and that gap should be named in the report, not
-    silently left unmentioned.
+Honesty notes (state these plainly in the report, guide §12):
+  - Break-Before-Make is briefly disruptive: between BREAK and the
+    Hybrid target connecting, the switch has no controller session.
+    Report the measured connect time (post["latency_ms"]).
+  - Verification checks OVS's own is_connected state for the Hybrid
+    target. It does not inject OpenFlow traffic, so it cannot by itself
+    prove the control path carries working Flow-Mods; a switch that
+    stays connected but is mis-programmed would not be caught here.
+  - OpenFlow ROLE negotiation is not exercised (that needs controller
+    app support).
+  - The verification window adds wall-clock cost of about T x number
+    of migrated switches; report it when writing this up.
+  - The "data-plane check" from the migration protocol is NOT
+    implemented here. `data_plane_check_fn` is a documented extension
+    point; until it is wired in, verification runs without it and that
+    gap should be named in the report.
+  - post["overhead_bytes"] and baseline["overhead_bytes"] are
+    certificate/key file-size proxies, not on-wire byte counts.
 
 Interface (guide section 5.4, frozen -- optimizer.py's run_sgbm() is
 written against this exact shape and must not need to change when the
@@ -214,7 +168,6 @@ import re
 import shutil
 import socket
 import statistics
-import struct
 import subprocess
 import time
 
@@ -272,13 +225,8 @@ CUTOVER_POLL_TIMEOUT_S = 10          # B-B-M cutover: wait for Hybrid-only
 CUTOVER_POLL_INTERVAL_S = 0.5        # OVS Controller target to connect
 
 # -- Break-Before-Make post-cutover verification defaults --
-VERIFICATION_WINDOW_S = 12.0         # T: total sustained-check window
+VERIFICATION_WINDOW_S = 12.0         # T: first sample at t=0, last at t=T
 VERIFICATION_HEALTH_CHECKS = 4       # N: samples spread across T
-FEATURES_WAIT_S = 3.0                # per-sample: how long to wait for a
-                                      # Features Request / Flow-Mod after Hello+Echo
-OF_PROBE_TIMEOUT_S = 3.0             # per-sample probe socket timeout
-REQUIRE_FLOW_MOD_CONFIRMATION = True # hard-gate BREAK on seeing >=1 flow-mod;
-                                      # see the honesty note above before disabling
 
 
 def local_port_for_dpid(dpid: str) -> int:
@@ -293,27 +241,6 @@ def local_port_for_dpid(dpid: str) -> int:
     return 20000 + int(dpid[-2:], 16)
 
 
-def _probe_dpid(dpid: str) -> str:
-    """
-    A synthetic dpid used ONLY in the VERIFY-phase health probe's
-    Features Reply -- deliberately DIFFERENT from the switch's real
-    dpid.
-
-    CONFIRMED via live testing (2026-09-23): presenting the REAL dpid
-    here causes OS-Ken/Ryu's connection handling to treat the probe's
-    disposable connection as a NEWER session for the SAME datapath,
-    and evict/replace the real OVS connection mid-VERIFY -- this is
-    exactly the "no longer connected (flapping)" failure the flapping
-    check exists to catch, except the probe itself was the cause.
-
-    Top byte forced to 0xFE (never used by topo.py's real dpid
-    assignments, which all start 00) so this can never collide with
-    any real switch, while remaining a well-formed 8-byte dpid so the
-    Features Reply itself stays valid OpenFlow.
-    """
-    return "fe" + dpid[2:]
-
-
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -322,183 +249,11 @@ def _empty_metrics(failure_rate: float = 1.0) -> dict:
     return {"latency_ms": 0.0, "failure_rate": failure_rate, "overhead_bytes": 0}
 
 
-# ---------------------------------------------------------------------
-# Minimal OpenFlow 1.3 wire format -- just enough to run a synthetic
-# HELLO / Echo Request-Reply / Features / Flow-Mod health check over a
-# raw socket (guide addendum's Make-Before-Break VERIFY phase). This is
-# NOT a general OpenFlow library -- it only speaks the handful of
-# message types the verification probe needs, and only well enough to
-# be a truthful peer for that purpose.
-# ---------------------------------------------------------------------
-
-OFP_VERSION = 0x04          # OpenFlow 1.3
-OFPT_HELLO = 0
-OFPT_ERROR = 1
-OFPT_ECHO_REQUEST = 2
-OFPT_ECHO_REPLY = 3
-OFPT_FEATURES_REQUEST = 5
-OFPT_FEATURES_REPLY = 6
-OFPT_FLOW_MOD = 14
-
-_OFP_HEADER = struct.Struct("!BBHI")  # version, type, length, xid
-
-
-def _of_header(msg_type: int, length: int, xid: int) -> bytes:
-    return _OFP_HEADER.pack(OFP_VERSION, msg_type, length, xid)
-
-
-def _of_hello(xid: int = 0) -> bytes:
-    return _of_header(OFPT_HELLO, 8, xid)
-
-
-def _of_echo_request(xid: int) -> bytes:
-    return _of_header(OFPT_ECHO_REQUEST, 8, xid)
-
-
-def _of_features_reply(xid: int, dpid_hex: str) -> bytes:
-    """Minimal valid OFPT_FEATURES_REPLY body for OF1.3: datapath_id(8)
-    n_buffers(4) n_tables(1) auxiliary_id(1) pad(2) capabilities(4)
-    reserved(4) = 24 bytes. Port descriptions are not needed in 1.3
-    (they come via multipart), so this is a complete, valid message."""
-    dpid_bytes = bytes.fromhex(dpid_hex)
-    body = dpid_bytes + struct.pack("!IBB2xII", 0, 1, 0, 0, 0)
-    return _of_header(OFPT_FEATURES_REPLY, 8 + len(body), xid) + body
-
-
 class MigrationError(Exception):
     """Raised only for programmer-error-style conditions (e.g. a dpid
     that resolves to no OVS bridge at all). Real operational failures
     -- a bad handshake, a missing cert, a timeout -- are NOT exceptions;
     they are outcome="failed" results, per Algorithm 2's own design."""
-
-
-class _OpenFlowHealthProbe:
-    """
-    A synthetic OpenFlow 1.3 peer used ONLY for the Make-Before-Break
-    verification window. This does NOT drive the switch's real control
-    session -- it opens its OWN short-lived connection through the
-    same local stunnel client port the real OVS connection uses, so it
-    exercises the identical Hybrid tunnel path (local stunnel client ->
-    network -> shared stunnel server -> controller) without ever
-    touching OVS's own OpenFlow state machine. This is the standard
-    "synthetic health check" technique: inject probe traffic alongside
-    the real session, never through it.
-    """
-
-    def __init__(self, host: str, port: int, dpid: str, timeout: float):
-        self.host = host
-        self.port = port
-        self.dpid = dpid
-        self.timeout = timeout
-        self.sock: socket.socket | None = None
-        self._buf = b""
-
-    def __enter__(self) -> "_OpenFlowHealthProbe":
-        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        self.sock.settimeout(self.timeout)
-        return self
-
-    def __exit__(self, *exc_info):
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-
-    def _recv_message(self, deadline: float):
-        while len(self._buf) < 8:
-            remaining = max(0.05, deadline - time.monotonic())
-            self.sock.settimeout(remaining)
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("peer closed during header read")
-            self._buf += chunk
-        _version, msg_type, length, xid = _OFP_HEADER.unpack(self._buf[:8])
-        while len(self._buf) < length:
-            remaining = max(0.05, deadline - time.monotonic())
-            self.sock.settimeout(remaining)
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("peer closed during body read")
-            self._buf += chunk
-        body = self._buf[8:length]
-        self._buf = self._buf[length:]
-        return msg_type, xid, body
-
-    def run_healthcheck(self, want_flow_mod: bool, features_wait_s: float) -> dict:
-        """
-        Performs, over one disposable connection:
-          1. HELLO exchange.
-          2. Echo Request/Reply (the guide addendum's explicit
-             "Echo Request/Reply" bullet).
-          3. Answers a Features Request if the peer sends one, with a
-             minimal valid Features Reply carrying this switch's real
-             dpid (the "a feature request" bullet).
-          4. Watches (up to features_wait_s) for an unsolicited
-             Flow-Mod from the controller (the "dummy flow-mod"
-             bullet). Best-effort by nature -- see this file's
-             module-level honesty note on why a miss here is reported,
-             not treated as a probe malfunction.
-
-        Returns {"hello_ok", "echo_ok", "features_ok",
-        "flow_mod_observed", "error"}.
-        """
-        result = {
-            "hello_ok": False, "echo_ok": False,
-            "features_ok": False, "flow_mod_observed": False,
-            "error": None,
-        }
-        try:
-            deadline = time.monotonic() + max(self.timeout, features_wait_s)
-
-            self.sock.sendall(_of_hello(xid=1))
-            msg_type, _xid, _body = self._recv_message(deadline)
-            if msg_type != OFPT_HELLO:
-                result["error"] = f"expected HELLO from peer, got OF message type {msg_type}"
-                return result
-            result["hello_ok"] = True
-
-            echo_xid = 2
-            self.sock.sendall(_of_echo_request(echo_xid))
-
-            window_deadline = time.monotonic() + features_wait_s
-            while time.monotonic() < window_deadline:
-                have_echo = result["echo_ok"]
-                have_flow_mod = result["flow_mod_observed"] or not want_flow_mod
-                if have_echo and have_flow_mod:
-                    break
-                try:
-                    msg_type, xid, _body = self._recv_message(window_deadline)
-                except (socket.timeout, TimeoutError):
-                    break
-                except (OSError, ConnectionError):
-                    # Peer closed the connection while we were waiting for
-                    # more (best-effort) extras -- Features/Flow-Mod are
-                    # layered on top of the essential Hello/Echo check, so
-                    # if the peer is done talking to us after satisfying
-                    # those, that's a normal end of this probe's window,
-                    # NOT a health-check failure. Only a closed connection
-                    # BEFORE echo_ok is achieved should count against the
-                    # switch (that path is handled below, since echo_ok
-                    # simply stays False and the caller treats that as a
-                    # failed sample).
-                    break
-                if msg_type == OFPT_ECHO_REPLY and xid == echo_xid:
-                    result["echo_ok"] = True
-                elif msg_type == OFPT_ECHO_REQUEST:
-                    # peer pinging us back mid-exchange -- answer in kind,
-                    # harmless and keeps the connection looking legitimate
-                    self.sock.sendall(_of_header(OFPT_ECHO_REPLY, 8, xid))
-                elif msg_type == OFPT_FEATURES_REQUEST:
-                    self.sock.sendall(_of_features_reply(xid, self.dpid))
-                    result["features_ok"] = True
-                elif msg_type == OFPT_FLOW_MOD:
-                    result["flow_mod_observed"] = True
-
-            return result
-        except (OSError, ConnectionError) as exc:
-            result["error"] = str(exc)
-            return result
 
 
 # ---------------------------------------------------------------------
@@ -533,7 +288,7 @@ class CommandRunner:
 
 # ---------------------------------------------------------------------
 # MigrationExecutor -- Algorithm 2 (Guarded Migration Execution),
-# Stage 2 now implementing the Make-Before-Break protocol above.
+# Stage 2 implementing the Break-Before-Make protocol above.
 # ---------------------------------------------------------------------
 
 class MigrationExecutor:
@@ -550,7 +305,7 @@ class MigrationExecutor:
     topology : object with get_state(dpid) / set_state(dpid, value)
         In production this is the live TopologyAdapter OS-Ken app
         (network/topology.py). This executor calls set_state(dpid,
-        "Hybrid") in exactly one place (on a verified, make-before-break
+        "Hybrid") in exactly one place (on a verified Break-Before-Make
         cutover success) and nowhere else -- see the state ownership
         rule, guide §2.3.
     ledger : object with log_event(dpid, baseline, post, outcome,
@@ -562,18 +317,10 @@ class MigrationExecutor:
         Defaults to the real subprocess-backed CommandRunner(). Inject
         a fake for tests (see __main__).
     data_plane_check_fn : callable(dpid, switch_name) -> (ok, reason), optional
-        Extension point for the migration protocol's own "the
-        data-plane check in Section 4" -- NOT implemented in this
-        file (see the module-level honesty note for why). Defaults to
-        None, meaning the verification window runs without it; wire in
-        the real check here once that section's spec is available,
-        rather than approximating it.
-    require_flow_mod_confirmation : bool
-        Hard-gates BREAK on observing >=1 real Flow-Mod during VERIFY,
-        per the protocol's "grace-close only after a flow-mod round
-        trip succeeds" rule. Only set False if you've confirmed your
-        controller app never proactively pushes one -- and say so in
-        the report (see the module-level honesty note).
+        Extension point for the migration protocol's own "data-plane
+        check" -- NOT implemented in this file (see the module-level
+        honesty notes). Defaults to None, meaning verification runs
+        without it.
     Every other keyword overrides one of the module-level defaults
     above (ports, cert paths, binaries, timeouts) without needing to
     edit this file -- e.g. a second VM's IP for hybrid_server_host.
@@ -609,9 +356,6 @@ class MigrationExecutor:
         cutover_poll_interval: float = CUTOVER_POLL_INTERVAL_S,
         verification_window_s: float = VERIFICATION_WINDOW_S,
         verification_health_checks: int = VERIFICATION_HEALTH_CHECKS,
-        features_wait_s: float = FEATURES_WAIT_S,
-        of_probe_timeout: float = OF_PROBE_TIMEOUT_S,
-        require_flow_mod_confirmation: bool = REQUIRE_FLOW_MOD_CONFIRMATION,
         data_plane_check_fn=None,
         verbose: bool = True,
     ):
@@ -651,9 +395,6 @@ class MigrationExecutor:
 
         self.verification_window_s = verification_window_s
         self.verification_health_checks = verification_health_checks
-        self.features_wait_s = features_wait_s
-        self.of_probe_timeout = of_probe_timeout
-        self.require_flow_mod_confirmation = require_flow_mod_confirmation
         self.data_plane_check_fn = data_plane_check_fn
 
         self.verbose = verbose
@@ -719,7 +460,7 @@ class MigrationExecutor:
         raise MigrationError(f"no OVS bridge with datapath_id={dpid!r} found (is topo.py running?)")
 
     # -----------------------------------------------------------------
-    # Baseline / post metrics -- real TLS handshake probes
+    # Baseline / post metrics
     # -----------------------------------------------------------------
 
     def _probe_handshake(self, openssl_bin, host, port, cert, key, ca, groups=None):
@@ -798,43 +539,27 @@ class MigrationExecutor:
         """
         Post-cutover metrics for the ACTUAL OVS Hybrid controller path.
 
-        Unlike the old implementation, this does not create a separate
-        openssl s_client connection to the Hybrid server.
-
-        The Hybrid path has already been proven during Stage 1 using the
-        PQC TLS handshake probe. After cutover, this method measures the
-        actual OVS controller connection state.
+        This does not create a separate openssl s_client connection to
+        the Hybrid server: the OVS->stunnel hop is plaintext, so an
+        independent handshake would not represent the OVS control
+        connection. The Hybrid TLS handshake was already proven in
+        Stage 1; after cutover this measures the real OVS connection.
         """
-
-        # The Hybrid connection itself is plaintext between OVS and the
-        # local stunnel client. Therefore an independent openssl handshake
-        # here would not represent the OVS control connection.
-
         samples = max(verification_samples, 1)
         failures = max(verification_failures, 0)
-
         failure_rate = round(failures / samples, 3)
 
         key, cert = self._hybrid_switch_cert_paths(switch_name)
 
         return {
-            # Time required for the REAL OVS Hybrid controller target
-            # to become connected after the cutover.
+            # Time for the REAL OVS Hybrid controller target to become
+            # connected after the cutover.
             "latency_ms": round(connect_latency_ms, 3),
-
-            # Fraction of verification samples during which the
-            # REAL OVS Hybrid controller was disconnected.
+            # Fraction of verification samples in which the REAL OVS
+            # Hybrid controller was disconnected.
             "failure_rate": failure_rate,
-
-            # Keep the existing certificate-size overhead proxy.
-            #
-            # This is still not wire overhead; it is the same
-            # certificate/key material size proxy used elsewhere.
-            "overhead_bytes": self._cert_chain_bytes(
-                cert,
-                key,
-                self.hybrid_ca_cert,
-            ),
+            # Certificate/key file-size proxy -- NOT wire overhead.
+            "overhead_bytes": self._cert_chain_bytes(cert, key, self.hybrid_ca_cert),
         }
 
     def _hybrid_switch_cert_paths(self, switch_name: str):
@@ -847,9 +572,8 @@ class MigrationExecutor:
 
     # -----------------------------------------------------------------
     # Stage 1 -- pre-flight: bring up stunnel, confirm the Hybrid group.
-    # Unchanged by the Make-Before-Break protocol: this stays entirely
-    # non-disruptive and never touches OVS's controller target, so the
-    # Legacy session is guaranteed untouched through this whole stage.
+    # Entirely non-disruptive: never touches OVS's controller target,
+    # so the Legacy session is untouched through this whole stage.
     # -----------------------------------------------------------------
 
     def _render_client_conf(self, dpid: str, switch_name: str, local_port: int) -> str:
@@ -989,6 +713,14 @@ class MigrationExecutor:
                 fh.write(self._render_client_conf(dpid, switch_name, local_port))
             self._log(f"starting Hybrid stunnel client for {dpid} ({switch_name}) on port {local_port}")
             client_stderr = os.path.join(self.hybrid_log_dir, f"client_{dpid}.stderr")
+
+            # Truncate the per-run client log so _dry_run_confirm_hybrid_group
+            # can't match a "TLS connected" line left over from a previous
+            # run and declare Stage 1 passed on a stale handshake.
+            client_log = os.path.join(self.hybrid_log_dir, f"client_{dpid}.log")
+            with open(client_log, "w"):
+                pass
+
             proc = self.runner.popen(
                 [self.hybrid_stunnel_bin, client_conf_path], stdout_path=client_stderr,
                 env=self._stunnel_env(),
@@ -1047,6 +779,10 @@ class MigrationExecutor:
         legitimately render as "(null)" in the log for a PQC group
         with no OpenSSL NID (see D2 above), so name-matching would
         reject a fully correct Hybrid handshake.
+
+        The client log is truncated when the client is launched (see
+        _ensure_stunnel_pair_up), so a match here belongs to THIS
+        migration attempt, not a previous run.
         """
         try:
             with socket.create_connection(("127.0.0.1", local_port), timeout=self.handshake_probe_timeout) as s:
@@ -1093,20 +829,21 @@ class MigrationExecutor:
         return True, baseline, local_port, None
 
     # -----------------------------------------------------------------
-    # Stage 2 -- cutover (currently Break-Before-Make)
+    # Stage 2 -- Break-Before-Make cutover
     # -----------------------------------------------------------------
 
     def _set_controller_target(self, switch_name: str, *targets: str):
-	"""
-	Atomically replace the bridge's complete OVS controller set.
-	One target means the bridge uses exactly that controller:
-	Legacy-only or Hybrid-only.
-	The B-B-M migration uses this operation twice at most:
-	1. switch to Hybrid-only for the cutover;
-	2. restore Legacy-only if Hybrid verification fails.
-	Supplying the complete resulting controller set makes each
-	ovs-vsctl operation an explicit controller-set replacement.
-	"""
+        """
+        Atomically replace the bridge's complete OVS controller set.
+        One target means the bridge uses exactly that controller:
+        Legacy-only or Hybrid-only.
+
+        The B-B-M migration uses this operation twice at most:
+          1. switch to Hybrid-only for the cutover;
+          2. restore Legacy-only if Hybrid verification fails.
+        Supplying the complete resulting controller set makes each
+        ovs-vsctl operation an explicit controller-set replacement.
+        """
         return self.runner.run(
             ["ovs-vsctl", "set-controller", switch_name, *targets],
             timeout=self.handshake_probe_timeout,
@@ -1114,17 +851,18 @@ class MigrationExecutor:
 
     def _controller_target_connected(self, switch_name: str, target: str) -> bool:
         """
-	Check the connection state of one specific OVS Controller target.
+        Check the connection state of one specific OVS Controller target.
 
-	This is deliberately a per-target check rather than a bridge-wide
-	aggregate. During B-B-M migration the controller set contains only
-	the target being tested, so this directly answers whether the actual
-	Hybrid OVS connection is established.
+        This is deliberately a per-target check rather than a bridge-wide
+        aggregate. During B-B-M migration the controller set contains only
+        the target being tested, so this directly answers whether the
+        actual Hybrid OVS connection is established.
 
-	`find Controller target=...` is scoped to the OVSDB. The Hybrid
-	target contains a per-switch local port, so targets are unique
-	between switches.
-	"""
+        `find Controller target=...` is scoped to the whole OVSDB, not to
+        one bridge; that is fine because the Hybrid target contains a
+        per-switch local port, so targets are unique between switches.
+        (switch_name is kept for a descriptive call interface.)
+        """
         rc, out, _err = self.runner.run(
             ["ovs-vsctl", "--bare", "--columns=is_connected", "find", "Controller",
              f'target="{target}"'],
@@ -1171,12 +909,10 @@ class MigrationExecutor:
         # -------------------------------------------------------------
         # BREAK
         # -------------------------------------------------------------
-        #
         # Remove Legacy first and make Hybrid the ONLY controller target.
         # This is intentionally disruptive for the brief cutover interval,
         # but avoids OVS/OS-Ken having two simultaneous sessions for the
         # same real DPID.
-        #
         rc, out, err = self._set_controller_target(switch_name, new_target)
 
         if rc != 0:
@@ -1198,12 +934,8 @@ class MigrationExecutor:
         # -------------------------------------------------------------
         # WAIT FOR THE ACTUAL OVS HYBRID CONNECTION
         # -------------------------------------------------------------
-        #
-        # We do NOT create _OpenFlowHealthProbe().
-        #
-        # We ask OVS itself whether the controller object corresponding
+        # Ask OVS itself whether the controller object corresponding
         # to the Hybrid target is actually connected.
-        #
         connect_deadline = time.monotonic() + self.cutover_poll_timeout
 
         connected = False
@@ -1236,14 +968,17 @@ class MigrationExecutor:
         # -------------------------------------------------------------
         # VERIFY THE SAME OVS CONNECTION
         # -------------------------------------------------------------
+        # No synthetic OpenFlow connection. Every sample asks OVS about
+        # the controller object that the bridge is actually using.
         #
-        # There is deliberately NO synthetic OpenFlow connection here.
-        #
-        # Every sample asks OVS about the controller object that the
-        # bridge is actually using.
-        #
+        # N samples span the full window: first at t=0, last at t=T, so
+        # the gap between samples is T/(N-1).
         n = max(1, self.verification_health_checks)
-        interval = self.verification_window_s / n if n > 1 else self.verification_window_s
+        interval = (
+            self.verification_window_s / (n - 1)
+            if n > 1
+            else self.verification_window_s
+        )
 
         failed_samples = 0
 
@@ -1292,14 +1027,11 @@ class MigrationExecutor:
         # -------------------------------------------------------------
         # SUCCESS
         # -------------------------------------------------------------
-        #
-        # At this point:
         #   - Hybrid stunnel was already proven in Stage 1
         #   - OVS switched to Hybrid-only
         #   - OVS reported the Hybrid controller connected
         #   - The SAME OVS controller connection remained connected
         #     throughout the verification window
-        #
         post = self._capture_metrics_hybrid(
             dpid,
             switch_name,
@@ -1316,7 +1048,7 @@ class MigrationExecutor:
 
     def migrate(self, dpid: str) -> dict:
         """
-        Run the full pre-flight + Make-Before-Break cutover for one
+        Run the full pre-flight + Break-Before-Make cutover for one
         switch. Safe to call repeatedly for the same dpid (e.g. after
         monitor.py rolls it back and the SGBM loop re-admits it, guide
         §9.1) -- each call is a fresh attempt from whatever the current
@@ -1324,7 +1056,7 @@ class MigrationExecutor:
 
         This is the ONLY function in the whole orchestrator allowed to
         call topology.set_state(dpid, "Hybrid"); it does so in exactly
-        one place below, only after BREAK completes.
+        one place below, only after Stage 2 verification passes.
         """
         if self.topology.get_state(dpid) == "Hybrid":
             # Already migrated (e.g. re-queued by mistake); nothing to
@@ -1376,7 +1108,7 @@ class MigrationExecutor:
                     "post": None, "timestamp": _now_iso()}
 
         if not ok2:
-            self._log(f"Make-Before-Break failed for {dpid} ({switch_name}): {reason2}")
+            self._log(f"Break-Before-Make failed for {dpid} ({switch_name}): {reason2}")
             self.ledger.log_event(dpid, baseline, None, outcome="failed", reason=reason2)
             return {"dpid": dpid, "outcome": "failed", "baseline": baseline,
                     "post": None, "timestamp": _now_iso()}
@@ -1394,9 +1126,7 @@ class MigrationExecutor:
 
 # ---------------------------------------------------------------------
 # Self-test -- exercises every branch of migrate() with a fake
-# CommandRunner (no real Mininet/OVS/stunnel/OpenSSL needed) plus a
-# tiny in-process OpenFlow peer standing in for "the controller,
-# reached through the local Hybrid stunnel client" during VERIFY. This
+# CommandRunner (no real Mininet/OVS/stunnel/OpenSSL needed). This
 # validates the CONTROL FLOW only. The guide's own §11 test checklist
 # item for Feature 4 -- "manually run the cutover against one real
 # switch; confirm ovs-vsctl show reports is_connected: true and the
@@ -1437,16 +1167,21 @@ if __name__ == "__main__":
         """
         Scripted responses keyed by a recognizable substring of the
         command, so each test case below can drive a different branch
-        of migrate() (Stage 1 pass/fail, MAKE never connecting, etc.)
+        of migrate() (Stage 1 pass/fail, Hybrid never connecting, etc.)
         without touching the real system.
+
+        popen() simulates a client stunnel launch by writing
+        `client_log_text` (if not None) to client_<dpid>.log AFTER the
+        executor has truncated it, mirroring what a real stunnel does.
         """
 
         def __init__(self, bridge_name="s3", dpid="0000000000000003",
-                     stage2_connects=True, flap_after=None):
+                     stage2_connects=True, flap_after=None, client_log_text=None):
             self.bridge_name = bridge_name
             self.dpid = dpid
             self.stage2_connects = stage2_connects
-            self.flap_after = flap_after  # sample index after which the new target reports disconnected
+            self.flap_after = flap_after  # new-target find calls after which it reports disconnected
+            self.client_log_text = client_log_text
             self.set_controller_calls = []
             self._find_calls_for_new_target = 0
 
@@ -1460,7 +1195,7 @@ if __name__ == "__main__":
             if "get bridge" in joined and "datapath_id" in joined:
                 return 0, f'"{self.dpid}"\n', ""
             if "s_client" in joined:
-                # simulate a fast, successful handshake for baseline/post capture
+                # simulate a fast, successful handshake for baseline capture
                 return 0, "Verification: OK\n", ""
             if "find" in joined and "Controller" in joined and "target=" in joined:
                 m = re.search(r'target="([^"]+)"', joined)
@@ -1477,37 +1212,33 @@ if __name__ == "__main__":
             return 0, "", ""
 
         def popen(self, args, stdout_path=None, env=None):
+            if (stdout_path and os.path.basename(stdout_path).startswith("client_")
+                    and self.client_log_text is not None):
+                log_path = stdout_path[: -len(".stderr")] + ".log"
+                with open(log_path, "w") as fh:
+                    fh.write(self.client_log_text)
+
             class _FakeProc:
                 def poll(self_inner):
                     return None  # "still running"
             return _FakeProc()
 
-    class _FakeOFPeerServer:
-        """
-        Minimal OpenFlow 1.3 peer used ONLY by these self-tests to
-        answer _OpenFlowHealthProbe's HELLO/Echo/Features/Flow-Mod
-        exchange over a real local TCP port -- standing in for "the
-        controller, reached through the local Hybrid stunnel client"
-        without needing a real stunnel/OpenSSL/OS-Ken stack. Accepts
-        connections in a loop so it can serve Stage 1's dry-run
-        connect AND every VERIFY-phase probe's own separate connection.
-        """
+    class _FakeListener:
+        """Stands in for the local stunnel client's plaintext accept
+        port: accepts and drops connections so the executor's
+        listener-ready wait and dry-run connect succeed."""
 
-        def __init__(self, port, send_features=True, send_flow_mod=True, echo_ok=True):
-            self.send_features = send_features
-            self.send_flow_mod = send_flow_mod
-            self.echo_ok = echo_ok
-            self.last_features_reply_dpid = None  # set by _handle once a probe answers Features
+        def __init__(self, port):
             self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._srv.bind(("127.0.0.1", port))
             self._srv.listen(8)
             self._srv.settimeout(0.2)
             self._stop = False
-            self._thread = threading.Thread(target=self._serve_forever, daemon=True)
+            self._thread = threading.Thread(target=self._serve, daemon=True)
             self._thread.start()
 
-        def _serve_forever(self):
+        def _serve(self):
             while not self._stop:
                 try:
                     conn, _addr = self._srv.accept()
@@ -1515,57 +1246,6 @@ if __name__ == "__main__":
                     continue
                 except OSError:
                     break
-                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
-
-        @staticmethod
-        def _recvn(conn, n):
-            buf = b""
-            while len(buf) < n:
-                chunk = conn.recv(n - len(buf))
-                if not chunk:
-                    return None
-                buf += chunk
-            return buf
-
-        def _handle(self, conn):
-            conn.settimeout(2.0)
-            try:
-                header = self._recvn(conn, 8)
-                if not header:
-                    return
-                _v, mtype, length, xid = _OFP_HEADER.unpack(header)
-                if length > 8:
-                    self._recvn(conn, length - 8)
-                if mtype != OFPT_HELLO:
-                    return
-                conn.sendall(_of_hello(xid=0))
-
-                header2 = self._recvn(conn, 8)
-                if not header2:
-                    return
-                _v2, mtype2, length2, xid2 = _OFP_HEADER.unpack(header2)
-                if length2 > 8:
-                    self._recvn(conn, length2 - 8)
-                if mtype2 == OFPT_ECHO_REQUEST and self.echo_ok:
-                    conn.sendall(_of_header(OFPT_ECHO_REPLY, 8, xid2))
-
-                if self.send_features:
-                    conn.sendall(_of_header(OFPT_FEATURES_REQUEST, 8, 100))
-                    fh = self._recvn(conn, 8)
-                    if fh:
-                        _v3, _mtype3, length3, _xid3 = _OFP_HEADER.unpack(fh)
-                        if length3 > 8:
-                            body3 = self._recvn(conn, length3 - 8)
-                            if body3 and len(body3) >= 8:
-                                self.last_features_reply_dpid = body3[:8].hex()
-
-                if self.send_flow_mod:
-                    dummy_body = b"\x00" * 40
-                    conn.sendall(_of_header(OFPT_FLOW_MOD, 8 + len(dummy_body), 200) + dummy_body)
-                    time.sleep(0.05)
-            except (OSError, struct.error):
-                pass
-            finally:
                 try:
                     conn.close()
                 except OSError:
@@ -1578,6 +1258,19 @@ if __name__ == "__main__":
             except OSError:
                 pass
             self._thread.join(timeout=1)
+
+    GOOD_LOG = (
+        "LOG7[0]: TLS state (connect): SSL negotiation finished successfully\n"
+        "LOG6[0]: TLS connected: new session negotiated\n"
+        "LOG6[0]: TLSv1.3 ciphersuite: TLS_AES_256_GCM_SHA384 (256-bit encryption)\n"
+        "LOG6[0]: Peer temporary key: (null), 768 bits\n"
+    )
+    BAD_LOG = (
+        "LOG4[0]: Rejected by CERT at depth=0: CN=sdn-switch-hybrid\n"
+        "LOG7[0]: TLS alert (write): fatal: bad certificate\n"
+        "LOG3[0]: SSL_accept: ssl/statem/statem_srvr.c:3777: error:0A000086:"
+        "SSL routines::certificate verify failed\n"
+    )
 
     def _make_executor(tmp_dir, runner, **overrides):
         hybrid_cert_dir = os.path.join(tmp_dir, "hybrid_certs")
@@ -1606,47 +1299,13 @@ if __name__ == "__main__":
             cutover_poll_timeout=1,
             cutover_poll_interval=0.1,
             verification_window_s=0.6,
-            verification_health_checks=2,
-            features_wait_s=1.0,
-            of_probe_timeout=1.0,
+            verification_health_checks=3,
             verbose=False,
         )
         kwargs.update(overrides)
         topo = FakeTopology()
         ledger = FakeLedger()
         return MigrationExecutor(topo, ledger, **kwargs), topo, ledger
-
-    def _write_stunnel_client_log(executor, dpid, success, error_snippet=None):
-        """
-        Writes a client_<dpid>.log excerpt shaped like a REAL stunnel
-        5.63 session (see the live test transcript this was calibrated
-        against, and D2's note above) -- not a fabricated line the
-        parser was designed around. success=True writes the same
-        "TLS connected: new session negotiated" + "Peer temporary key:
-        (null), 768 bits" pair a real Hybrid handshake produces.
-        success=False writes a realistic handshake-error excerpt
-        instead (default: a certificate-verify failure, the same shape
-        as the "Rejected by CERT" case a verifyPeer/verifyChain
-        misconfiguration actually produced during live testing).
-        """
-        os.makedirs(executor.hybrid_log_dir, exist_ok=True)
-        log_path = os.path.join(executor.hybrid_log_dir, f"client_{dpid}.log")
-        if success:
-            body = (
-                "LOG7[0]: TLS state (connect): SSL negotiation finished successfully\n"
-                "LOG6[0]: TLS connected: new session negotiated\n"
-                "LOG6[0]: TLSv1.3 ciphersuite: TLS_AES_256_GCM_SHA384 (256-bit encryption)\n"
-                "LOG6[0]: Peer temporary key: (null), 768 bits\n"
-            )
-        else:
-            body = error_snippet or (
-                "LOG4[0]: Rejected by CERT at depth=0: CN=sdn-switch-hybrid\n"
-                "LOG7[0]: TLS alert (write): fatal: bad certificate\n"
-                "LOG3[0]: SSL_accept: ssl/statem/statem_srvr.c:3777: error:0A000086:"
-                "SSL routines::certificate verify failed\n"
-            )
-        with open(log_path, "w") as fh:
-            fh.write(body)
 
     def _write_hybrid_cert_material(executor, switch_name):
         key, cert = executor._hybrid_switch_cert_paths(switch_name)
@@ -1662,145 +1321,142 @@ if __name__ == "__main__":
         open(os.path.join(executor.hybrid_conf_dir, "server.conf"), "w").write("; fake\n")
 
     dpid = "0000000000000003"
+    port = local_port_for_dpid(dpid)
+    legacy_only_cmd = "ovs-vsctl set-controller s3 ssl:127.0.0.1:6653"
+    hybrid_only_cmd = f"ovs-vsctl set-controller s3 tcp:127.0.0.1:{port}"
 
-    print("=== Test 1: full success -- MAKE, VERIFY (echo+features+flow-mod), atomic BREAK ===")
+    def _assert_never_dual_controller(runner):
+        for args in runner.set_controller_calls:
+            targets = args[3:]
+            assert len(targets) == 1, f"set-controller must carry exactly one target, got {args}"
+
+    print("=== Test 1: full success -- BREAK to Hybrid-only, wait, VERIFY, state flips ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True, client_log_text=GOOD_LOG)
         executor, topo, ledger = _make_executor(tmp, runner)
         _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port, send_features=True, send_flow_mod=True)
+        listener = _FakeListener(port)
         try:
-            _write_stunnel_client_log(executor, dpid, success=True)
             result = executor.migrate(dpid)
         finally:
-            peer.stop()
+            listener.stop()
 
         assert result["outcome"] == "success", result
         assert result["post"] is not None
         assert topo.get_state(dpid) == "Hybrid"
         assert ledger.events[-1]["outcome"] == "success"
         calls = [" ".join(c) for c in runner.set_controller_calls]
-        assert any(f"ssl:127.0.0.1:6653" in c and f"tcp:127.0.0.1:{port}" in c for c in calls), \
-            "MAKE must configure BOTH targets in one call"
-        assert calls[-1].endswith(f"tcp:127.0.0.1:{port}"), \
-            "BREAK must be a final atomic call to the new target ALONE"
-        print("  OK: MAKE added dual controller, VERIFY passed with a flow-mod observed, "
-              "BREAK atomically cut to Hybrid-only")
+        assert calls == [hybrid_only_cmd], calls
+        _assert_never_dual_controller(runner)
+        print("  OK: single set-controller call, Hybrid-only; state flipped to Hybrid")
 
     print("\n=== Test 2: Stage 1 fails (handshake/cert error in stunnel log) -> cutover never attempted ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True, client_log_text=BAD_LOG)
         executor, topo, ledger = _make_executor(tmp, runner)
         _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port)
+        listener = _FakeListener(port)
         try:
-            _write_stunnel_client_log(executor, dpid, success=False)
             result = executor.migrate(dpid)
         finally:
-            peer.stop()
+            listener.stop()
 
         assert result["outcome"] == "failed", result
         assert result["post"] is None
         assert topo.get_state(dpid) == "Legacy"
-        assert not runner.set_controller_calls, "MAKE must never run when Stage 1 fails"
+        assert not runner.set_controller_calls, "BREAK must never run when Stage 1 fails"
         assert "handshake error" in ledger.events[-1]["reason"]
-        print("  OK: outcome=failed, state stays Legacy, MAKE never attempted")
+        print("  OK: outcome=failed, state stays Legacy, OVS controller set never touched")
 
-    print("\n=== Test 3: missing Hybrid stunnel binary -> fails closed before MAKE, no crash ===")
+    print("\n=== Test 3: missing Hybrid stunnel binary -> fails closed before BREAK, no crash ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True)
         executor, topo, ledger = _make_executor(tmp, runner)
         # deliberately do NOT create executor.hybrid_stunnel_bin
         result = executor.migrate(dpid)
 
         assert result["outcome"] == "failed", result
         assert topo.get_state(dpid) == "Legacy"
+        assert not runner.set_controller_calls
         assert "stunnel binary not found" in ledger.events[-1]["reason"]
         print("  OK: a missing/non-executable stunnel binary fails cleanly before touching OVS")
 
-    print("\n=== Test 4: MAKE -- second connection never comes up -> revert to Legacy-only ===")
+    print("\n=== Test 4: Hybrid target never connects -> restore Legacy-only ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=False)
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=False, client_log_text=GOOD_LOG)
         executor, topo, ledger = _make_executor(tmp, runner)
         _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port)
+        listener = _FakeListener(port)
         try:
-            _write_stunnel_client_log(executor, dpid, success=True)
             result = executor.migrate(dpid)
         finally:
-            peer.stop()
+            listener.stop()
 
         assert result["outcome"] == "failed", result
         assert topo.get_state(dpid) == "Legacy"
         calls = [" ".join(c) for c in runner.set_controller_calls]
-        assert any(f"tcp:127.0.0.1:{port}" in c and "ssl:127.0.0.1:6653" in c for c in calls), \
-            "must attempt MAKE (dual controller)"
-        assert calls[-1] == f"ovs-vsctl set-controller s3 ssl:127.0.0.1:6653", \
-            "must revert to Legacy-only, alone, as the final call"
-        print("  OK: MAKE attempted, never connected, reverted to Legacy-only -- live session untouched")
+        assert calls == [hybrid_only_cmd, legacy_only_cmd], calls
+        assert "did not report" in ledger.events[-1]["reason"]
+        print("  OK: Hybrid-only attempted, never connected, Legacy-only restored")
 
-    print("\n=== Test 5: VERIFY -- connection flaps mid-window -> abort, revert to Legacy-only ===")
+    print("\n=== Test 5: VERIFY -- connection drops mid-window -> abort, restore Legacy-only ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True, flap_after=1)
+        # find call 1 = connect wait, call 2 = sample 1 (ok), then it drops
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True, flap_after=2,
+                                   client_log_text=GOOD_LOG)
         executor, topo, ledger = _make_executor(tmp, runner)
         _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port, send_features=True, send_flow_mod=True)
+        listener = _FakeListener(port)
         try:
-            _write_stunnel_client_log(executor, dpid, success=True)
             result = executor.migrate(dpid)
         finally:
-            peer.stop()
+            listener.stop()
 
         assert result["outcome"] == "failed", result
         assert topo.get_state(dpid) == "Legacy"
-        assert "flapping" in ledger.events[-1]["reason"]
-        print("  OK: flapping new connection caught mid-VERIFY, discarded before BREAK")
-
-    print("\n=== Test 6: VERIFY -- no Flow-Mod observed, required -> cutover blocked ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
-        executor, topo, ledger = _make_executor(tmp, runner, require_flow_mod_confirmation=True)
-        _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port, send_features=True, send_flow_mod=False)  # never sends one
-        try:
-            _write_stunnel_client_log(executor, dpid, success=True)
-            result = executor.migrate(dpid)
-        finally:
-            peer.stop()
-
-        assert result["outcome"] == "failed", result
-        assert topo.get_state(dpid) == "Legacy"
-        assert "Flow-Mod round trip" in ledger.events[-1]["reason"]
+        assert "disconnected during sample" in ledger.events[-1]["reason"]
         calls = [" ".join(c) for c in runner.set_controller_calls]
-        assert calls[-1] == f"ovs-vsctl set-controller s3 ssl:127.0.0.1:6653", \
-            "must revert to Legacy-only when the required flow-mod gate isn't met"
-        print("  OK: connectivity+echo passed every sample, but missing flow-mod blocked BREAK")
+        assert calls == [hybrid_only_cmd, legacy_only_cmd], calls
+        print("  OK: disconnect caught during VERIFY, Legacy-only restored")
 
-    print("\n=== Test 7: same missing-flow-mod scenario, but require_flow_mod_confirmation=False ===")
+    print("\n=== Test 6: no dual-controller configuration is ever issued, in any outcome ===")
+    for label, kw in (("success", dict(stage2_connects=True)),
+                      ("never-connects", dict(stage2_connects=False)),
+                      ("drops", dict(stage2_connects=True, flap_after=2))):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = FakeCommandRunner(dpid=dpid, client_log_text=GOOD_LOG, **kw)
+            executor, topo, ledger = _make_executor(tmp, runner)
+            _prep_stunnel_pair(executor)
+            listener = _FakeListener(port)
+            try:
+                executor.migrate(dpid)
+            finally:
+                listener.stop()
+            assert runner.set_controller_calls, label
+            _assert_never_dual_controller(runner)
+    print("  OK: every set-controller call carried exactly one target")
+
+    print("\n=== Test 7: data-plane check fails -> abort, restore Legacy-only ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
-        executor, topo, ledger = _make_executor(tmp, runner, require_flow_mod_confirmation=False)
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True, client_log_text=GOOD_LOG)
+        executor, topo, ledger = _make_executor(
+            tmp, runner, data_plane_check_fn=lambda d, s: (False, "boom"))
         _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port, send_features=True, send_flow_mod=False)
+        listener = _FakeListener(port)
         try:
-            _write_stunnel_client_log(executor, dpid, success=True)
             result = executor.migrate(dpid)
         finally:
-            peer.stop()
+            listener.stop()
 
-        assert result["outcome"] == "success", result
-        assert topo.get_state(dpid) == "Hybrid"
-        print("  OK: escape hatch works -- cutover proceeds without a flow-mod when explicitly allowed")
+        assert result["outcome"] == "failed", result
+        assert topo.get_state(dpid) == "Legacy"
+        assert "data-plane check failed: boom" in ledger.events[-1]["reason"]
+        assert " ".join(runner.set_controller_calls[-1]) == legacy_only_cmd
+        print("  OK: failing data_plane_check_fn blocks the migration and rolls back")
 
-    print("\n=== Test 8: already-Hybrid dpid is a no-op success, MAKE never attempted ===")
+    print("\n=== Test 8: already-Hybrid dpid is a no-op success, BREAK never attempted ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True)
         executor, topo, ledger = _make_executor(tmp, runner)
         topo.set_state(dpid, "Hybrid")
         result = executor.migrate(dpid)
@@ -1809,29 +1465,38 @@ if __name__ == "__main__":
         assert not runner.set_controller_calls
         print("  OK: idempotent re-migrate of an already-Hybrid switch is a clean no-op")
 
-    print("\n=== Test 9: VERIFY probe must present a dpid DIFFERENT from the real switch ===")
+    print("\n=== Test 9: stale success line from a previous run must NOT pass Stage 1 ===")
     with tempfile.TemporaryDirectory() as tmp:
-        runner = FakeCommandRunner(bridge_name="s3", dpid=dpid, stage2_connects=True)
+        # client_log_text=None: the (fake) new client run never writes a handshake line
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True, client_log_text=None)
         executor, topo, ledger = _make_executor(tmp, runner)
         _prep_stunnel_pair(executor)
-        port = local_port_for_dpid(dpid)
-        peer = _FakeOFPeerServer(port, send_features=True, send_flow_mod=True)
+        os.makedirs(executor.hybrid_log_dir, exist_ok=True)
+        with open(os.path.join(executor.hybrid_log_dir, f"client_{dpid}.log"), "w") as fh:
+            fh.write(GOOD_LOG)  # yesterday's successful handshake
+        listener = _FakeListener(port)
         try:
-            _write_stunnel_client_log(executor, dpid, success=True)
             result = executor.migrate(dpid)
         finally:
-            peer.stop()
+            listener.stop()
 
-        assert result["outcome"] == "success", result
-        assert peer.last_features_reply_dpid is not None, "probe never answered a Features Request"
-        assert peer.last_features_reply_dpid != dpid, (
-            "REGRESSION: VERIFY probe presented the switch's REAL dpid in its Features "
-            "Reply. Confirmed via live testing (2026-09-23) that this makes OS-Ken/Ryu "
-            "evict the real OVS session mid-VERIFY, causing spurious 'flapping' aborts. "
-            "The probe must always use _probe_dpid(dpid), never dpid itself."
-        )
-        print(f"  OK: probe used {peer.last_features_reply_dpid!r}, real switch dpid "
-              f"{dpid!r} was never presented -- OS-Ken can't confuse the two")
+        assert result["outcome"] == "failed", result
+        assert not runner.set_controller_calls
+        assert "no completed-handshake line" in ledger.events[-1]["reason"]
+        print("  OK: stale log was truncated at client launch; Stage 1 failed instead of passing")
+
+    print("\n=== Test 10: verification samples span the whole window (first at 0, last at T) ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = FakeCommandRunner(dpid=dpid, stage2_connects=True)
+        executor, topo, ledger = _make_executor(
+            tmp, runner, verification_window_s=0.6, verification_health_checks=3)
+        start = time.monotonic()
+        ok, post, reason = executor._stage2_break_before_make(dpid, "s3", port)
+        elapsed = time.monotonic() - start
+        assert ok, reason
+        # 3 samples -> 2 gaps of T/(N-1)=0.3s => ~0.6s. The old T/N formula gave ~0.4s.
+        assert elapsed >= 0.55, f"verification only spanned {elapsed:.2f}s, expected ~0.6s"
+        print(f"  OK: verification spanned {elapsed:.2f}s for T=0.6s")
 
     print("\nAll migrate_link.py self-checks passed (no real Mininet/OVS/stunnel/OpenSSL required).")
     print("Live-system check still required per guide §11: manually run the cutover against one")
