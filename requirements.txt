@@ -1,0 +1,9 @@
+networkx
+os-ken
+numpy
+pandas
+cryptography
+pyOpenSSL
+requests
+PyYAML
+scipy

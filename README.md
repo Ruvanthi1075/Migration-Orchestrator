@@ -40,8 +40,7 @@ migration/
   migrate_link.py           [not yet started] Guarded Migration Execution (Person C)
 
 (not yet present)
-  monitor.py                [not yet started] TDM + BRD — degradation monitoring & rollback (Person D)
-  ledger.py                  [not yet started] Migration Metadata Ledger (Person C/D)
+  monitor.py                health observation, metric evaluation, recovery decisions, and explicit rollback (Person D)
 ```
 
 ## The corrected model (read before touching any file)
@@ -132,7 +131,7 @@ cd network && python3 coverage.py
   causing `topology.py` to discover a near-full-mesh of phantom links instead of the
   real ~7-link topology. Confirmed live: link count climbed toward C(7,2)=21 before the
   fix.
-- **`migrate_link.py`, `monitor.py`, `ledger.py` not started yet** — Person C/D's work.
+- **Monitoring implementation is present:** `monitor.py` supports read-only connectivity observation, injected health metrics, health reports, and non-executing recovery decisions. Live latency/failure-rate telemetry and automatic recovery orchestration remain incomplete.
 - **STP means the discovered graph can legitimately vary between runs** (7 links vs. 6,
   depending on which redundant leg STP blocks) — this is expected behavior, not a bug;
   `coverage.py`'s functions are topology-agnostic by design and were verified correct
