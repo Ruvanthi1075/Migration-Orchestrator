@@ -28,13 +28,61 @@ Person B can build and test it (see the __main__ block below) before
 either of those modules exists, per the guide's section 10 build
 order.
 
-Contract (guide section 7.1, frozen -- optimizer.py is written
-against this exact shape):
-    CapabilityTracker(base_cost=1.0)
+PER-SWITCH COST MODEL (SGBM_Literature_Backed_Formulation.docx, Sec. 7)
+-----------------------------------------------------------------------
+cost(s) replaces the old uniform base_cost=1.0 and is measured, not
+assumed:
+
+    cost_base(s) = norm_dlat(s) / 3 + COST_FLOOR        in [0.259, 0.592]
+    norm_dlat(s) = min-max over switches of
+                   median(hybrid handshake ms) - median(classical ms)
+    COST_FLOOR   = (D_COMPUTE + D_PAYLOAD) / 3 = (0.309 + 0.468) / 3 = 0.259
+    cost(s)      = cost_base(s) * (1 + 2 * failure_rate(s))   (unchanged)
+
+budget_costs() below turns a calibration pass's raw handshake timings
+into the base_costs dict. The total budget B is NOT computed here: it
+is the knob swept for Table I / Fig. 2, B = beta * sum(cost(s)) with
+beta in {0.25, 0.5, 0.75, 1.0}, set by whatever script calls
+optimizer.run_sgbm() (see optimizer/run_experiment.py).
+
+Contract (guide section 7.1; constructor changed from base_cost=1.0 to
+the per-switch form below -- record()/cost() are unchanged in shape):
+    CapabilityTracker(base_costs=None, default_cost=COST_FLOOR)
     .record(dpid, outcome)      outcome in {"success", "failed"}
     .cost(dpid)  -> float       migration cost optimizer.py should charge
                                  for this switch this round
 """
+
+import statistics
+
+# Constants from the formulation doc (Sec. 7). D_COMPUTE / D_PAYLOAD are
+# the normalized compute and payload deltas; their mean over 3 is the
+# minimum a switch can cost, i.e. the cost of a zero-extra-latency one.
+D_COMPUTE, D_PAYLOAD = 0.309, 0.468
+COST_FLOOR = (D_COMPUTE + D_PAYLOAD) / 3          # 0.259
+
+
+def budget_costs(classical_ms, hybrid_ms):
+    """
+    classical_ms, hybrid_ms : dict dpid -> list of handshake times (ms)
+    Returns dict dpid -> cost_base(s) in [COST_FLOOR, COST_FLOOR + 1/3].
+
+    delta(s) = median(hybrid) - median(classical), min-max normalized
+    across switches, then cost = norm/3 + COST_FLOOR. If every switch
+    has the same delta (no spread to normalize), all get COST_FLOOR.
+    """
+    delta = {
+        s: statistics.median(hybrid_ms[s]) - statistics.median(classical_ms[s])
+        for s in hybrid_ms
+    }
+    if not delta:
+        return {}
+    lo, hi = min(delta.values()), max(delta.values())
+    return {
+        s: (0.0 if hi - lo < 1e-9 else (v - lo) / (hi - lo)) / 3 + COST_FLOOR
+        for s, v in delta.items()
+    }
+
 
 
 class CapabilityTracker:
@@ -49,16 +97,33 @@ class CapabilityTracker:
 
     No probability distributions, no sampling -- just running counts,
     per the spec. A dpid that has never been attempted costs exactly
-    `base_cost`, i.e. no assumption of failure before any evidence
+    its base cost, i.e. no assumption of failure before any evidence
     exists.
+
+    base_costs : dict dpid -> float, optional
+        Measured per-switch base cost, from budget_costs(). A dpid not
+        in the dict falls back to `default_cost`.
+    default_cost : float
+        Base cost for a dpid with no calibration entry (COST_FLOOR).
     """
 
-    def __init__(self, base_cost=1.0):
-        if base_cost <= 0:
-            raise ValueError("base_cost must be positive")
-        self.base_cost = float(base_cost)
+    def __init__(self, base_costs=None, default_cost=COST_FLOOR):
+        if default_cost <= 0:
+            raise ValueError("default_cost must be positive")
+        base_costs = dict(base_costs or {})
+        if any(v <= 0 for v in base_costs.values()):
+            raise ValueError("every base cost must be positive")
+        self.base_costs = base_costs          # dpid -> (norm_dlat/3 + 0.259)
+        self.default_cost = float(default_cost)
         # dpid (str) -> {"success": int, "failed": int}
         self.history = {}
+
+    def _base(self, dpid):
+        return self.base_costs.get(dpid, self.default_cost)
+
+    def total_cost(self, dpids):
+        """Sum of cost(s) over `dpids` -- use for B = beta * total_cost(all)."""
+        return sum(self.cost(d) for d in dpids)
 
     def record(self, dpid, outcome):
         """
@@ -75,26 +140,19 @@ class CapabilityTracker:
     def cost(self, dpid):
         """
         Migration cost to charge against the budget for `dpid` this
-        round. Unattempted switches cost exactly base_cost. Otherwise
-        base_cost is scaled up by (1 + 2 * failure_rate), so a switch
-        that has failed every attempt so far costs 3x base_cost, while
-        one with a clean record still costs exactly base_cost.
+        round. A switch with no attempts costs exactly its base cost.
+        Otherwise the base cost is scaled by (1 + 2 * failure_rate), so
+        a switch that has failed every attempt costs 3x its base.
 
         The 2.0x multiplier is a starting point, not a derived
-        constant -- tune it from real handshake failure data once
-        Feature 4 (migrate_link.py) is producing live outcomes; note
-        this explicitly in the report rather than presenting it as a
-        calibrated value (matches the guide's honesty-note convention
-        in section 2.2/12).
+        constant -- tune it from real handshake failure data and state
+        that in the report rather than presenting it as calibrated.
         """
         h = self.history.get(dpid)
-        if h is None:
-            return self.base_cost
-        attempts = h["success"] + h["failed"]
-        if attempts == 0:
-            return self.base_cost
-        failure_rate = h["failed"] / attempts
-        return self.base_cost * (1.0 + 2.0 * failure_rate)
+        n = (h["success"] + h["failed"]) if h else 0
+        if n == 0:
+            return self._base(dpid)
+        return self._base(dpid) * (1.0 + 2.0 * h["failed"] / n)
 
     def success_rate(self, dpid):
         """
@@ -127,40 +185,55 @@ class CapabilityTracker:
 
 if __name__ == "__main__":
     # Self-test -- no Feature 1 / Feature 2 dependency, per guide 7.1.
-    tracker = CapabilityTracker(base_cost=1.0)
+    tracker = CapabilityTracker()
 
     dpid_a = "0000000000000003"
     dpid_b = "0000000000000004"
 
-    # Never-attempted dpid: neutral cost and neutral success rate.
-    assert tracker.cost(dpid_a) == 1.0
+    assert abs(COST_FLOOR - 0.259) < 1e-9
+    # Never-attempted dpid: default (floor) cost, neutral success rate.
+    assert abs(tracker.cost(dpid_a) - COST_FLOOR) < 1e-9
     assert tracker.success_rate(dpid_a) == 0.5
 
     tracker.record(dpid_a, "success")
     tracker.record(dpid_a, "success")
-    # 2 success, 0 failed -> cost unchanged, success_rate == 1.0
-    assert tracker.cost(dpid_a) == 1.0
+    assert abs(tracker.cost(dpid_a) - COST_FLOOR) < 1e-9
     assert tracker.success_rate(dpid_a) == 1.0
 
     tracker.record(dpid_b, "failed")
     tracker.record(dpid_b, "failed")
     tracker.record(dpid_b, "success")
-    # 1 success, 2 failed -> failure_rate = 2/3 -> cost = 1 + 2*(2/3) = 2.333...
+    # failure_rate = 2/3 -> cost = floor * (1 + 2*(2/3))
     cost_b = tracker.cost(dpid_b)
-    assert abs(cost_b - (1.0 + 2.0 * (2 / 3))) < 1e-9, cost_b
-    rate_b = tracker.success_rate(dpid_b)
-    assert abs(rate_b - (1 / 3)) < 1e-9, rate_b
+    assert abs(cost_b - COST_FLOOR * (1.0 + 2.0 * (2 / 3))) < 1e-9, cost_b
+    assert abs(tracker.success_rate(dpid_b) - (1 / 3)) < 1e-9
 
-    # base_cost is honored as a scale factor, not just a default of 1.0
-    tracker2 = CapabilityTracker(base_cost=2.0)
-    tracker2.record(dpid_a, "failed")
-    assert abs(tracker2.cost(dpid_a) - (2.0 * (1.0 + 2.0 * 1.0))) < 1e-9
+    # Per-switch base cost is honored, and failures scale it.
+    t2 = CapabilityTracker(base_costs={dpid_a: 0.5})
+    assert t2.cost(dpid_a) == 0.5
+    assert abs(t2.cost(dpid_b) - COST_FLOOR) < 1e-9      # not in dict -> default
+    t2.record(dpid_a, "failed")
+    assert abs(t2.cost(dpid_a) - 0.5 * 3.0) < 1e-9
+    assert abs(t2.total_cost([dpid_a, dpid_b]) - (1.5 + COST_FLOOR)) < 1e-9
 
-    try:
-        CapabilityTracker(base_cost=0)
-        raise AssertionError("expected ValueError for non-positive base_cost")
-    except ValueError:
-        pass
+    # budget_costs: range is [0.259, 0.592], min/max switches hit the ends.
+    classical = {"a": [10, 11, 10], "b": [10, 10, 10], "c": [10, 10, 10]}
+    hybrid = {"a": [12, 12, 12], "b": [20, 20, 20], "c": [32, 32, 32]}
+    bc = budget_costs(classical, hybrid)      # deltas: 2, 10, 22
+    assert abs(bc["a"] - COST_FLOOR) < 1e-9
+    assert abs(bc["c"] - (COST_FLOOR + 1 / 3)) < 1e-9   # 0.5923
+    assert all(COST_FLOOR - 1e-9 <= v <= 0.5924 for v in bc.values())
+    assert COST_FLOOR < bc["b"] < bc["c"]
+    # degenerate: identical deltas -> everyone at the floor
+    flat = budget_costs({"a": [1], "b": [1]}, {"a": [2], "b": [2]})
+    assert all(abs(v - COST_FLOOR) < 1e-9 for v in flat.values())
+
+    for bad in ({"default_cost": 0}, {"base_costs": {"x": 0}}):
+        try:
+            CapabilityTracker(**bad)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
 
     try:
         tracker.record(dpid_a, "bogus")
@@ -171,3 +244,4 @@ if __name__ == "__main__":
     print("All capability_tracker.py self-checks passed.\n")
     print("Summary:")
     print(tracker.summary())
+

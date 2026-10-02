@@ -107,8 +107,9 @@ from coverage import (  # noqa: E402
     compute_legacy_set,
     compute_gain,
     flow_weight,
+    core_switch,
 )
-from capability_tracker import CapabilityTracker  # noqa: E402
+from optimizer.capability_tracker import CapabilityTracker, COST_FLOOR  # noqa: E402
 
 # alpha for score(f) and progress(s), Sec. 6.1/6.2 of
 # SGBM_Literature_Backed_Formulation.docx. alpha=1 is the value with a
@@ -206,9 +207,16 @@ def pick_best_batch(G, flows, budget, capability):
     lines 10-12; SCORE_ALPHA=1 per reformulation doc Sec. 6.1 --
     plain gain/cost, citing Khuller-Moss-Naor / CELF).
 
-    gain(f) is computed via a single compute_gain() call over the
-    union of every candidate's Lf, so this makes exactly one coverage
-    sweep per round no matter how many flows are in contention.
+    gain(f) follows Sec. 4 exactly:
+        gain(f) = CoverageAfterMigrating(Lf(f)) - C
+    i.e. the TOTAL coverage added by migrating this candidate's batch,
+    including every OTHER flow that batch happens to complete (flows
+    sharing switches on their paths). compute_gain() returns a
+    per-flow dict, so it is evaluated once per candidate with
+    hypothetical = that candidate's own Lf and summed over all flows.
+    Scoring only the candidate's own entry (the previous behaviour)
+    undercounts shared batches -- the exact supermodular effect SGBM
+    exists to exploit.
 
     Returns (flow, Lf, cost_Lf, gain) for the winning flow, or None if
     no flow's full batch fits within `budget`.
@@ -217,17 +225,14 @@ def pick_best_batch(G, flows, budget, capability):
     if not candidates:
         return None
 
-    hypothetical = set()
-    for _, Lf, _ in candidates:
-        hypothetical |= Lf
-    gains = compute_gain(G, flows, hypothetical)
+    scored = []
+    for f, Lf, cost_Lf in candidates:
+        gain = sum(compute_gain(G, flows, Lf).values())
+        scored.append((gain / (cost_Lf ** SCORE_ALPHA), f, Lf, cost_Lf, gain))
 
-    def score(candidate):
-        f, _Lf, cost_Lf = candidate
-        return gains.get(f["name"], 0.0) / (cost_Lf ** SCORE_ALPHA)
-
-    best_f, best_Lf, best_cost = max(candidates, key=score)
-    return best_f, best_Lf, best_cost, gains.get(best_f["name"], 0.0)
+    # max() keeps the first of equal scores -> deterministic given flow order.
+    _score, best_f, best_Lf, best_cost, best_gain = max(scored, key=lambda t: t[0])
+    return best_f, best_Lf, best_cost, best_gain
 
 
 def _pick_progress_switch(G, flows, budget, capability):
@@ -295,7 +300,11 @@ def run_sgbm(G, flows, budget, migrate_fn, capability=None, verbose=True):
         "name", "destination_dpid", "criticality", "security_sla",
         "latency_sla".
     budget : float
-        Total migration budget for this run (Algorithm 1's B).
+        Total migration budget for this run (Algorithm 1's B), in the
+        same units as capability.cost(s) (per-switch costs lie in
+        [0.259, 0.592] when calibrated). B is not derived here: sweep
+        it from the calling script as B = beta * sum(cost(s)), beta in
+        {0.25, 0.5, 0.75, 1.0} -- see optimizer/run_experiment.py.
     migrate_fn : callable(dpid: str) -> dict
         Per guide section 5.4. In production this is
         migrate_link.migrate (Feature 4, Person C); for standalone
@@ -465,21 +474,18 @@ if __name__ == "__main__":
     print(f"Migrated {len(schedule)} switch(es) across the run.")
 
     # --- Test 2: tight budget -> exercises the fallback progress path ---
+    # Default cost is COST_FLOOR = 0.259 per switch. The cheapest flow
+    # batch here is 2 switches (0.518), so a budget of 0.3 can't afford
+    # any batch but can afford exactly one single switch.
     G2, name2 = _fake_graph()
     flows2 = _fake_flows(name2)
     tracker2 = CapabilityTracker()
-    # Budget of 1.0 can't afford ANY flow's full batch (every flow needs
-    # >= 1 switch on a 2-hop path, i.e. cost >= 1, but ctrl_s3/ctrl_s4
-    # need only their edge switch since s1 is already the target of a
-    # shared aggregation hop -- exercise both branches by checking the
-    # schedule is non-empty and coverage only ever increases).
     schedule2, cov_after_2 = run_sgbm(
-        G2, flows2, budget=1.0, migrate_fn=_fake_migrate_always_success,
+        G2, flows2, budget=0.3, migrate_fn=_fake_migrate_always_success,
         capability=tracker2, verbose=False,
     )
-    assert len(schedule2) >= 1
-    assert cov_after_2 >= 0.0
-    assert cov_after_2 <= total_weight
+    assert len(schedule2) == 1
+    assert 0.0 <= cov_after_2 <= total_weight
 
     # --- Test 3: a failed migration should not flip state, and should
     #     raise that switch's cost so the tracker actually reacts ---
@@ -499,9 +505,37 @@ if __name__ == "__main__":
     assert G3.nodes[flaky_switch]["state"] == "Hybrid"  # eventually migrated
     # 1 success, 1 failed -> failure_rate 0.5 baked into future cost,
     # even though this run already finished migrating it successfully
-    assert abs(tracker3.cost(flaky_switch) - 1.0 * (1.0 + 2.0 * 0.5)) < 1e-9
+    assert abs(tracker3.cost(flaky_switch) - COST_FLOOR * (1.0 + 2.0 * 0.5)) < 1e-9
+
+    # --- Test 4: gain counts every flow a batch completes (Sec. 4) ---
+    # Chain core c <- m <- e (+ leaf x so c has the top degree).
+    # Flow A: m -> c.  Flow B: e -> m -> c.  Migrating B's batch
+    # {e, m, c} also completes A, so B's true gain is w(A) + w(B),
+    # not just w(B) (the old per-flow value).
+    G5 = nx.Graph()
+    c, m, e = f"{0:016x}", f"{1:016x}", f"{2:016x}"
+    x = f"{3:016x}"
+    for d in (c, m, e, x):
+        G5.add_node(d, state="Legacy")
+    G5.add_edge(m, c)
+    G5.add_edge(e, m)
+    G5.add_edge(x, c)       # extra leaf so the core c has the top degree
+    assert core_switch(G5) == c
+    fa = {"name": "A", "destination_dpid": m,
+          "criticality": 0.5, "security_sla": 0.5, "latency_sla": 0.5}
+    fb = {"name": "B", "destination_dpid": e,
+          "criticality": 0.5, "security_sla": 0.5, "latency_sla": 0.5}
+    wa, wb = flow_weight(fa), flow_weight(fb)
+    t5 = CapabilityTracker()
+    pick = pick_best_batch(G5, [fa, fb], budget=100.0, capability=t5)
+    best_f, best_Lf, best_cost, best_gain = pick
+    # B's batch {e, m, c} also completes A -> gain = wa + wb, score
+    # = (wa+wb)/(3*floor) beats A's batch {m, c}: wa/(2*floor).
+    assert best_f["name"] == "B", best_f["name"]
+    assert abs(best_gain - (wa + wb)) < 1e-9, best_gain
 
     print("\nCapability tracker (Test 1) summary:")
     print(tracker.summary())
 
     print("\nAll optimizer.py self-checks passed (no topology.py or OS-Ken required).")
+
