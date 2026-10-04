@@ -1,136 +1,147 @@
-# QSMO Migration-Orchestrator
+# Quantum Safe Migration Orchestrator (QSMO)
 
-### Hybrid Controller Migration with SGBM, BBM, Health Monitoring, and Automatic Recovery
+### Hybrid SDN Controller Migration with SGBM, BBM, Health Monitoring, and Automatic Recovery
 
-QSMO Migration-Orchestrator is a research and demonstration project for orchestrating SDN controller migration between a Legacy controller mode and a Hybrid controller mode.
+[![Platform](https://img.shields.io/badge/platform-Ubuntu-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/)
+[![Network Emulator](https://img.shields.io/badge/network-Mininet-blue)](http://mininet.org/)
+[![Controller](https://img.shields.io/badge/controller-OS--Ken-informational)](https://github.com/faucetsdn/ryu)
 
-The project demonstrates migration coordination, controller connectivity verification, health monitoring, rollback decisions, and post-recovery network reachability checks.
+QSMO Migration-Orchestrator is a research and demonstration system for coordinating Software-Defined Networking (SDN) controller migration between a **Legacy** mode and a **Hybrid** mode. It combines migration coordination, controller-connection verification, health monitoring, rollback decisions, and network reachability validation in an emulated environment.
 
-## Overview
+> **Demonstration note:** The integrated rollback scenario uses deliberately injected synthetic health values to exercise recovery. These values are test inputs, not measurements from a production network.
 
-The integrated demonstration combines:
+---
 
-- **SGBM and BBM:** Migration coordination and hybrid migration workflow.
-- **Hybrid controller migration:** Migration of selected switches from Legacy to Hybrid mode.
-- **Controller connectivity verification:** Checks that switches connect to the expected controller endpoint.
-- **Health monitoring:** Observes migration health indicators.
-- **Automatic rollback:** Reverts migrated switches when configured health conditions are violated.
-- **Migration ledger:** Records migration and rollback outcomes.
-- **Mininet validation:** Checks end-to-end host reachability after recovery.
+## Contents
 
-## Demonstrated Environment
+- [Project at a glance](#project-at-a-glance)
+- [Capabilities](#capabilities)
+- [Architecture and workflow](#architecture-and-workflow)
+- [Demonstration environment](#demonstration-environment)
+- [Repository layout](#repository-layout)
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+- [Run the integrated demonstration](#run-the-integrated-demonstration)
+- [Validate network connectivity](#validate-network-connectivity)
+- [Run tests](#run-tests)
+- [Demonstrated results](#demonstrated-results)
+- [Monitoring scenario](#monitoring-scenario)
+- [Logs and troubleshooting](#logs-and-troubleshooting)
+- [Limitations](#limitations)
+- [Future work](#future-work)
 
-The integrated demonstration uses:
+## Project at a glance
 
-- Ubuntu Linux virtual machine
-- Mininet network emulation
-- Open vSwitch (OVS)
-- OS-Ken SDN controller
-- Python
-- Linux shell scripts
+| Item | Description |
+|---|---|
+| Domain | Software-Defined Networking (SDN) |
+| Main purpose | Coordinated controller migration and recovery |
+| Migration workflow | SGBM and BBM components |
+| Network environment | Mininet and Open vSwitch |
+| Controller framework | OS-Ken |
+| Demonstrated topology | 7 switches and 8 hosts |
+| Demonstrated migration targets | `s1`, `s2`, and `s5` |
+| Validation | Controller-state checks, migration ledger, and Mininet `pingall` |
 
-The demonstrated topology contains 7 switches and 8 hosts.
+## Capabilities
 
-## Key Demonstration Features
+- **Migration coordination:** Coordinates selected switch migration through the SGBM/BBM workflow.
+- **Hybrid migration:** Moves selected switches from Legacy mode to Hybrid mode.
+- **Connection verification:** Checks switch/controller connectivity and migration verification samples.
+- **Health monitoring:** Evaluates latency and failure-rate indicators against configured thresholds.
+- **Automatic rollback:** Reverts a migrated switch when the configured demonstration health conditions are violated.
+- **Outcome tracking:** Records migration and rollback outcomes in the migration ledger.
+- **Network validation:** Uses Mininet host reachability tests to check connectivity after recovery.
 
-### Hybrid migration
-
-The demonstration migrates switches s1, s2, and s5 into Hybrid mode.
-
-The migration workflow checks controller connectivity and performs verification samples before considering a cutover successful.
-
-### Health monitoring
-
-The monitoring workflow evaluates latency and failure-rate indicators against configured thresholds.
-
-### Automatic recovery
-
-When the demonstration's health conditions trigger a rollback, the orchestrator returns the selected switches to Legacy mode and verifies their controller connectivity.
-
-### Network validation
-
-Mininet's `pingall` command is used to validate host-to-host reachability after rollback.
-
-## Architecture and Workflow
+## Architecture and workflow
 
 ```mermaid
 flowchart TD
-    A["QSMO Migration Orchestrator"] --> B["Topology and Controller Setup"]
-    B --> C["SGBM / BBM Migration Coordination"]
-    C --> D["Legacy to Hybrid Migration"]
-    D --> E["Controller Connectivity Verification"]
-    E --> F["Health Monitoring"]
-    F --> G{"Health conditions satisfied?"}
-    G -->|Yes| H["Continue Hybrid Operation"]
-    G -->|No| I["Automatic Rollback"]
-    I --> J["Restore Legacy Controller Mode"]
-    J --> K["Verify Controller Connectivity"]
-    K --> L["Mininet Reachability Test"]
-    H --> M["Migration Outcome and Ledger"]
-    L --> M
+    A["QSMO Migration Orchestrator"] --> B["Initialize topology and controller"]
+    B --> C["Check Legacy switch connections"]
+    C --> D["SGBM / BBM migration coordination"]
+    D --> E["Migrate selected switches to Hybrid"]
+    E --> F["Verify controller connectivity"]
+    F --> G["Observe health indicators"]
+    G --> H{"Health conditions satisfied?"}
+    H -->|Yes| I["Continue Hybrid operation"]
+    H -->|No| J["Trigger automatic rollback"]
+    J --> K["Restore Legacy mode"]
+    K --> L["Verify Legacy connectivity and ledger"]
+    I --> M["Report outcome"]
+    L --> N["Run Mininet reachability test"]
+    N --> M
 ```
 
-## Repository Structure
+## Demonstration environment
 
-The repository includes the following principal components:
+The integrated demonstration was run in an Ubuntu virtual machine with:
 
-| Path | Purpose |
-|---|---|
-| `controller/` | SDN controller application and switch behavior |
-| `migration/` | Migration coordination, migration logic, and monitoring |
-| `optimizer/` | Topology optimization components |
-| `tests/` | Integration and monitoring tests |
-| `run_qsmo_demo.sh` | Integrated demonstration launcher |
-| `README.md` | Project documentation |
+- Python 3
+- Mininet
+- Open vSwitch (OVS)
+- OS-Ken
+- Git
 
-Additional scripts and modules may be present in the repository.
+The demonstration topology contains seven switches and eight hosts. The launcher may use elevated privileges for network emulation and controller operations.
+
+## Repository layout
+
+```text
+Migration-Orchestrator/
+├── controller/          # SDN controller application and switch behavior
+├── migration/           # Migration workflow, coordination, and monitoring
+├── optimizer/           # Topology optimization components
+├── tests/               # Integration and monitoring tests
+├── README.md            # Project documentation
+└── run_qsmo_demo.sh     # Integrated demonstration launcher
+```
+
+Other project files may be present. The descriptions above identify the principal areas used by the documented workflow.
 
 ## Prerequisites
 
-The demonstration is intended for an Ubuntu environment with:
+Install or configure the following in a supported Ubuntu environment:
 
-- Python 3
-- Git
+- Git and Python 3
 - Mininet
 - Open vSwitch
-- OS-Ken
-- Required Python packages for the project
+- OS-Ken and the Python dependencies required by this repository
 
-Mininet and Open vSwitch require appropriate system privileges and installation.
+Mininet and Open vSwitch require system-level configuration and appropriate privileges. Use the installation instructions appropriate to your Ubuntu release and lab environment.
 
-## Getting Started
+## Setup
 
 ### 1. Clone the repository
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/Ruvanthi1075/Migration-Orchestrator.git
 cd Migration-Orchestrator
 ```
 
-Replace `<YOUR_REPOSITORY_URL>` with the repository's Git URL.
-
-### 2. Switch to the monitor branch
+### 2. Check out the demonstration branch
 
 ```bash
 git checkout monitor
 ```
 
-### 3. Create and activate a Python virtual environment
+### 3. Create a Python virtual environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-If the project has a `requirements.txt` file, install its dependencies:
+If a `requirements.txt` is present in the checked-out version, install its dependencies:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Install any system-level dependencies required by Mininet, Open vSwitch, and OS-Ken according to the project's environment.
+If no dependency file is provided, install the project's required Python packages using the versions configured for your lab environment. Ensure OS-Ken, Mininet, and OVS are available before running the integrated scenario.
 
-## Running the Integrated Demonstration
+## Run the integrated demonstration
 
 From the repository root:
 
@@ -139,127 +150,97 @@ chmod +x run_qsmo_demo.sh
 ./run_qsmo_demo.sh
 ```
 
-The launcher prepares and starts the integrated demonstration. It may request elevated privileges for networking and controller operations.
+The launcher starts the integrated demonstration and may request a password for privileged networking operations. Review the terminal output and wait for the final status.
 
-Follow the terminal output and wait for the demonstration's final result.
-
-The successful integrated run reports:
+A successful integrated run includes the marker:
 
 ```text
 INTEGRATED LIVE SGBM + MONITOR + AUTOMATIC ROLLBACK PASSED
 ```
 
-The exact output depends on the environment and test execution.
+The exact log details and results can vary by environment.
 
-## Demonstration Workflow
+## Validate network connectivity
 
-The integrated workflow includes:
-
-1. Initialize the Mininet topology and controller application.
-2. Check the initial Legacy controller connections.
-3. Migrate the selected switches into Hybrid mode.
-4. Verify Hybrid controller connectivity.
-5. Run health-monitoring observations.
-6. Trigger automatic rollback when the configured demonstration conditions are met.
-7. Verify that the switches return to Legacy mode.
-8. Inspect migration outcomes and the migration ledger.
-9. Validate host reachability using Mininet.
-
-## Network Connectivity Test
-
-When the Mininet CLI is available, run:
+When the Mininet command-line interface is available, run:
 
 ```text
 mininet> pingall
 ```
 
-A successful demonstration should report no dropped packets for the tested topology.
-
-To leave the Mininet CLI:
+A successful run should report no dropped packets for the tested topology. To leave the Mininet CLI:
 
 ```text
 mininet> exit
 ```
 
-## Monitoring and Test Data
+## Run tests
 
-**Important:** The integrated rollback demonstration uses deliberately injected synthetic health metrics to exercise the recovery workflow.
+The repository includes tests for monitoring, migration, rollback, and topology integration under `tests/`.
 
-The demonstrated values include:
-
-- Latency: 1000 ms
-- Failure rate: 0.50
-- Configured latency threshold: 100 ms
-- Configured failure-rate threshold: 0.10
-
-These are controlled demonstration inputs, not claims of measurements from a production network or live physical infrastructure.
-
-## Testing
-
-The repository contains integration and monitoring tests under `tests/`.
-
-Examples of test areas include:
-
-- Live SGBM migration workflow
-- Multi-switch migration
-- BBM rollback behavior
-- Live monitoring observations
-- Topology optimization integration
-
-Run tests from the repository root using the project's test runner and the test modules available in `tests/`.
-
-For example:
+A general test invocation is:
 
 ```bash
 python3 -m pytest tests/
 ```
 
-Some integration tests may require Mininet, Open vSwitch, OS-Ken, elevated privileges, or a configured test environment.
+Some integration tests may require Mininet, OVS, OS-Ken, elevated privileges, or a configured network environment. If a test fails because a system dependency is missing, install or configure that dependency before interpreting the result as a code failure.
 
-## Results and Validation
+## Demonstrated results
 
-The integrated demonstration has previously completed the following checks:
+In the recorded integrated demonstration:
 
-- 7 of 7 switches connected during initial preflight.
-- Switches s1, s2, and s5 migrated to Hybrid mode.
-- Hybrid connectivity and verification samples completed.
-- Health conditions triggered automatic rollback.
-- The selected switches returned to Legacy mode.
-- Migration ledger recorded successful migration and rollback outcomes.
-- Mininet reported 56 of 56 ping responses received, with 0% packet loss.
+- Initial controller preflight reported **7/7 switches connected**.
+- Switches `s1`, `s2`, and `s5` migrated to Hybrid mode.
+- Hybrid controller connectivity and verification samples completed for the selected switches.
+- The configured health scenario triggered automatic rollback.
+- The selected switches returned to Legacy mode and their controller connections were verified.
+- The migration ledger recorded migration and rollback outcomes.
+- Mininet `pingall` reported **56/56 responses received (0% packet loss)**.
 
-These results describe the demonstrated test run and are not a guarantee for every machine or execution.
+These are results from a demonstrated run, not a guarantee that every environment or execution will produce identical results.
 
-## Logs
+## Monitoring scenario
 
-The demonstration launcher writes a timestamped log under the user's home directory.
+The integrated rollback demonstration deliberately injects synthetic values to exercise the recovery path:
 
-Review the log for:
+| Indicator | Demonstration input | Configured threshold |
+|---|---:|---:|
+| Latency | 1000 ms | 100 ms |
+| Failure rate | 0.50 | 0.10 |
 
-- Controller startup
-- Switch connection status
-- Migration events
-- Monitoring observations
-- Rollback decisions
-- Final verification results
+Because the inputs are intentionally outside the configured thresholds, the scenario exercises the automatic rollback behavior. **Do not describe these injected values as live production measurements.**
+
+## Logs and troubleshooting
+
+The launcher creates a timestamped log in the user's home directory. Use the log to review controller startup, switch connections, migration events, health observations, rollback decisions, and final checks.
+
+Useful checks:
+
+```bash
+git status
+python3 --version
+which mn
+which ovs-vsctl
+```
+
+If the demo cannot start, check that Mininet and OVS are installed and available, that the launcher is being run from the repository root, and that required privileges are available. Avoid deleting project files or changing controller configuration until the relevant error in the log has been identified.
 
 ## Limitations
 
-- The project is demonstrated in an emulated Mininet environment.
-- Synthetic monitoring inputs are used to exercise automatic recovery.
-- Results depend on installed dependencies, system configuration, and runtime conditions.
-- Successful emulation does not by itself establish production-network performance or security.
+- The documented workflow is demonstrated in an emulated Mininet environment.
+- The rollback demonstration uses synthetic health inputs.
+- Results depend on software versions, system configuration, privileges, and runtime conditions.
+- Emulation results alone do not establish production-network performance, scalability, or security.
 
-## Future Improvements
+## Future work
 
-- Expand automated test coverage.
-- Add configurable monitoring profiles.
-- Improve structured logging and experiment result export.
-- Evaluate the workflow with additional topology sizes and failure scenarios.
-- Validate behavior under more realistic network measurements.
+- Add a pinned, reproducible dependency specification.
+- Expand automated tests across additional topology sizes and failure cases.
+- Export structured experiment results for easier comparison.
+- Evaluate monitoring with realistic measured traffic and clearly documented test conditions.
+- Improve setup checks and troubleshooting guidance.
 
 ## Disclaimer
 
-This project is intended for research, development, and controlled demonstration. Validate configuration and operational behavior before using it in any real network.
-
----
+This project is intended for research, development, and controlled demonstration. Review and validate configuration, dependencies, and operational behavior before using any component in a real network.
