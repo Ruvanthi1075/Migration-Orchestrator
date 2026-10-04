@@ -22,7 +22,11 @@ It verifies:
     8. Ledger records successful migrations.
 """
 
+import ast
+import contextlib
+import io
 import os
+import re
 import sys
 import time
 
@@ -38,7 +42,7 @@ from migration.migrate_link import MigrationExecutor
 from migration.ledger import MigrationLedger
 from optimizer.optimizer import run_sgbm
 from optimizer.capability_tracker import CapabilityTracker
-from network.coverage import compute_legacy_set, compute_path
+from network.coverage import compute_coverage, compute_legacy_set, compute_path
 
 
 # The Mininet topology under test has 7 switches.
@@ -453,20 +457,37 @@ class LiveSGBMMultiIntegration(app_manager.OSKenApp):
 
                 return result
 
+            initial_coverage = compute_coverage(graph, flows)
+            print(f"\nInitial coverage       : {initial_coverage:.3f}")
             print("\nStarting run_sgbm() with beta=0.50...\n")
 
             # ----------------------------------------------------------
-            # 8. Run actual SGBM
+            # 8. Run actual SGBM and capture its explicit round decisions
             # ----------------------------------------------------------
 
-            schedule, final_coverage = run_sgbm(
-                graph,
-                flows,
-                budget=budget,
-                migrate_fn=tracked_migrate,
-                capability=capability,
-                verbose=True,
-            )
+            optimizer_output = io.StringIO()
+            with contextlib.redirect_stdout(optimizer_output):
+                schedule, final_coverage = run_sgbm(
+                    graph,
+                    flows,
+                    budget=budget,
+                    migrate_fn=tracked_migrate,
+                    capability=capability,
+                    verbose=True,
+                )
+            optimizer_log = optimizer_output.getvalue()
+            print(optimizer_log, end="")
+
+            # Parse only the optimizer's own batch-decision log lines.
+            # This distinguishes a selected batch from an incidental
+            # contiguous sequence of successful migrations.
+            selected_batches = []
+            for line in optimizer_log.splitlines():
+                match = re.search(r"Round: completed flow=.*? batch=(\[[^\]]*\])", line)
+                if match:
+                    batch = ast.literal_eval(match.group(1))
+                    if isinstance(batch, list) and batch:
+                        selected_batches.append(batch)
 
             # The optimizer processes each selected Lf consecutively.
             # Recover the actual batches deterministically by replaying
@@ -489,55 +510,16 @@ class LiveSGBMMultiIntegration(app_manager.OSKenApp):
             ]
 
             # ----------------------------------------------------------
-            # 9. Recover selected batch boundaries from SGBM decisions
+            # 9. Use the actual batches emitted by SGBM
             # ----------------------------------------------------------
-
-            #
-            # A direct and robust way to expose the selected batches is to
-            # use the schedule order together with the optimizer's actual
-            # candidate sets. We simulate the same candidate-selection
-            # process on a fresh graph state using the successful schedule.
-            #
-            # For this live integration test, the primary proof is the
-            # initial affordable multi-switch candidate plus the fact that
-            # SGBM's batch branch emits "batch=[...]" in verbose output.
-            #
-            # To make the assertion machine-checkable without depending on
-            # stdout parsing, we inspect the first selected batch directly
-            # from the migration sequence against the initial candidate
-            # sets.
 
             successful_dpids = [
                 result["dpid"]
                 for result in successful
             ]
-
-            # Find a candidate whose complete Lf appears as a contiguous
-            # subsequence of successful migrations in the order used by
-            # run_sgbm (sorted Lf).
-            selected_multi_batches = []
-
-            for candidate in initial_candidates:
-                legacy_set = candidate["legacy_set"]
-
-                if len(legacy_set) < 2:
-                    continue
-
-                ordered_batch = sorted(legacy_set)
-
-                for start in range(
-                    0,
-                    len(successful_dpids) - len(ordered_batch) + 1,
-                ):
-                    window = successful_dpids[
-                        start:start + len(ordered_batch)
-                    ]
-
-                    if window == ordered_batch:
-                        selected_multi_batches.append(
-                            ordered_batch
-                        )
-                        break
+            selected_multi_batches = [
+                batch for batch in selected_batches if len(batch) >= 2
+            ]
 
             # ----------------------------------------------------------
             # 10. Result summary
@@ -640,9 +622,9 @@ class LiveSGBMMultiIntegration(app_manager.OSKenApp):
             # 14. Coverage must increase
             # ----------------------------------------------------------
 
-            assert final_coverage > 0.0, (
-                "SGBM completed migrations but final coverage did not "
-                "increase above zero."
+            assert final_coverage > initial_coverage, (
+                f"Coverage did not improve: initial={initial_coverage:.3f}, "
+                f"final={final_coverage:.3f}."
             )
 
             # ----------------------------------------------------------

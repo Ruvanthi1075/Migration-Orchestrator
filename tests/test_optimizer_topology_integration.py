@@ -5,11 +5,10 @@ import networkx as nx
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "network"))
-sys.path.insert(0, str(ROOT / "optimizer"))
 
 from topology import TopologyAdapter
 from optimizer import run_sgbm
-from capability_tracker import CapabilityTracker
+from optimizer.capability_tracker import CapabilityTracker
 
 
 def build_test_topology():

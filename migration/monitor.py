@@ -337,7 +337,42 @@ class MigrationMonitor:
                     dpid,
                 )
 
-        self.logger.info("Migration health reports: %s", reports)
+        self.logger.info("")
+        self.logger.info("=" * 76)
+        self.logger.info("                 QSMO | MIGRATION HEALTH REPORT")
+        self.logger.info("=" * 76)
+        self.logger.info(
+            "%-7s %-10s %-13s %10s %10s %-12s",
+            "Switch", "State", "Connection", "Latency", "Failure", "Health",
+        )
+        self.logger.info("-" * 76)
+
+        for item in reports:
+            dpid = str(item.get("dpid", "unknown"))
+            switch = "s" + str(int(dpid, 16)) if dpid.isalnum() and len(dpid) == 16 else dpid
+            latency = item.get("latency_ms")
+            failure = item.get("failure_rate")
+            latency_text = f"{latency:.1f} ms" if isinstance(latency, (int, float)) else "N/A"
+            failure_text = f"{failure * 100:.1f}%" if isinstance(failure, (int, float)) else "N/A"
+            connection = str(item.get("connectivity", "unknown")).upper()
+            health = str(item.get("status", "unknown")).upper()
+            self.logger.info(
+                "%-7s %-10s %-13s %10s %10s %-12s",
+                switch,
+                str(item.get("state", "unknown")),
+                connection,
+                latency_text,
+                failure_text,
+                health,
+            )
+            recovery = item.get("recovery")
+            if recovery:
+                self.logger.info(
+                    "         Recovery: %s",
+                    str(recovery.get("outcome", "unknown")).upper(),
+                )
+
+        self.logger.info("=" * 76)
         return reports
 
     def _monitor_loop(self):
@@ -460,16 +495,24 @@ class MigrationMonitor:
                     "reason": f"Legacy controller configuration failed: {error}",
                 }
 
-            connected = self.executor._controller_target_connected(
-                switch_name,
-                legacy_target,
-            )
+            connected = False
+            deadline = time.monotonic() + 10.0
+
+            while time.monotonic() < deadline:
+                if self.executor._controller_target_connected(
+                    switch_name,
+                    legacy_target,
+                ):
+                    connected = True
+                    break
+
+                time.sleep(0.5)
 
             if not connected:
                 return {
                     "dpid": dpid,
                     "outcome": "failed",
-                    "reason": "Legacy controller connection was not verified",
+                    "reason": "Legacy controller connection was not verified after 10 seconds",
                 }
 
             self.topology.set_state(dpid, "Legacy")

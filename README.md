@@ -1,149 +1,265 @@
-# QSMO — Automated Quantum-Safe Migration Orchestrator
+# QSMO Migration-Orchestrator
 
-An orchestrator that automatically migrates an SDN control plane from classical TLS
-("Legacy") to hybrid post-quantum TLS ("Hybrid"), one switch at a time, prioritized by
-which control links carry the most critical traffic — with automatic monitoring and
-rollback if a migrated link degrades.
+### Hybrid Controller Migration with SGBM, BBM, Health Monitoring, and Automatic Recovery
 
-Built on Mininet + Open vSwitch (the emulated network) and OS-Ken (the SDN controller
-framework, a maintained fork of Ryu).
+QSMO Migration-Orchestrator is a research and demonstration project for orchestrating SDN controller migration between a Legacy controller mode and a Hybrid controller mode.
 
-## What problem this solves
+The project demonstrates migration coordination, controller connectivity verification, health monitoring, rollback decisions, and post-recovery network reachability checks.
 
-The SDN controller talks to every switch over a TLS-encrypted control channel. Classical
-TLS is vulnerable to future quantum computers. NIST-standardized post-quantum algorithms
-(ML-KEM, ML-DSA) fix that, but migrating every switch at once isn't realistic — devices
-vary, PQC handshakes cost more, and not every link is equally important. This project
-automates the decision of **which switch to migrate next**, verifies each migration
-actually worked, and rolls it back automatically if it doesn't hold up under monitoring.
+## Overview
 
-## Repo layout
+The integrated demonstration combines:
 
+- **SGBM and BBM:** Migration coordination and hybrid migration workflow.
+- **Hybrid controller migration:** Migration of selected switches from Legacy to Hybrid mode.
+- **Controller connectivity verification:** Checks that switches connect to the expected controller endpoint.
+- **Health monitoring:** Observes migration health indicators.
+- **Automatic rollback:** Reverts migrated switches when configured health conditions are violated.
+- **Migration ledger:** Records migration and rollback outcomes.
+- **Mininet validation:** Checks end-to-end host reachability after recovery.
+
+## Demonstrated Environment
+
+The integrated demonstration uses:
+
+- Ubuntu Linux virtual machine
+- Mininet network emulation
+- Open vSwitch (OVS)
+- OS-Ken SDN controller
+- Python
+- Linux shell scripts
+
+The demonstrated topology contains 7 switches and 8 hosts.
+
+## Key Demonstration Features
+
+### Hybrid migration
+
+The demonstration migrates switches s1, s2, and s5 into Hybrid mode.
+
+The migration workflow checks controller connectivity and performs verification samples before considering a cutover successful.
+
+### Health monitoring
+
+The monitoring workflow evaluates latency and failure-rate indicators against configured thresholds.
+
+### Automatic recovery
+
+When the demonstration's health conditions trigger a rollback, the orchestrator returns the selected switches to Legacy mode and verifies their controller connectivity.
+
+### Network validation
+
+Mininet's `pingall` command is used to validate host-to-host reachability after rollback.
+
+## Architecture and Workflow
+
+```mermaid
+flowchart TD
+    A["QSMO Migration Orchestrator"] --> B["Topology and Controller Setup"]
+    B --> C["SGBM / BBM Migration Coordination"]
+    C --> D["Legacy to Hybrid Migration"]
+    D --> E["Controller Connectivity Verification"]
+    E --> F["Health Monitoring"]
+    F --> G{"Health conditions satisfied?"}
+    G -->|Yes| H["Continue Hybrid Operation"]
+    G -->|No| I["Automatic Rollback"]
+    I --> J["Restore Legacy Controller Mode"]
+    J --> K["Verify Controller Connectivity"]
+    K --> L["Mininet Reachability Test"]
+    H --> M["Migration Outcome and Ledger"]
+    L --> M
 ```
-network/
-  topology.py          Feature 1 — live control-plane graph (Person A)
-  coverage.py           Feature 2 — weakest-link security coverage math (Person A)
-  flows_config.json     per-switch flow definitions (criticality/security/latency weights)
-  topo.py                Mininet topology definition (Person C)
-  visualize.py            demo/report visualization, not part of the frozen interface
 
-controller/
-  simple_l2_switch.py    shared L2 learning-switch app (must ignore LLDP — see Known Issues)
+## Repository Structure
 
-optimizer/
-  optimizer.py            Algorithm 1 / SGBM greedy migration selection (Person B)
-  capability_tracker.py    per-device capability tracking (Person B)
+The repository includes the following principal components:
 
-migration/
-  gen_certs.sh             generates the CA/controller/switch cert chain for SSL
-  stunnel_configs/         stunnel client/server configs used for the two-stage PQC cutover
-  migrate_link.py           [not yet started] Guarded Migration Execution (Person C)
+| Path | Purpose |
+|---|---|
+| `controller/` | SDN controller application and switch behavior |
+| `migration/` | Migration coordination, migration logic, and monitoring |
+| `optimizer/` | Topology optimization components |
+| `tests/` | Integration and monitoring tests |
+| `run_qsmo_demo.sh` | Integrated demonstration launcher |
+| `README.md` | Project documentation |
 
-(not yet present)
-  monitor.py                health observation, metric evaluation, recovery decisions, and explicit rollback (Person D)
-```
+Additional scripts and modules may be present in the repository.
 
-## The corrected model (read before touching any file)
+## Prerequisites
 
-The original paper's Algorithm 1 conflates the migration target with the graph flow
-paths are measured over — that collapses once you're actually on a real SDN control
-channel, which is always 1 hop from controller to switch. This project splits it into
-two separate graphs:
+The demonstration is intended for an Ubuntu environment with:
 
-- **LINK graph** (`topology.py`) — switch↔switch adjacency, discovered live via
-  OS-Ken/LLDP. This is the control plane. The controller itself is never a node here.
-- Every place the original paper says "path Pf," read: *the switches that must be
-  Hybrid before flow f is fully protected*, computed over the LINK graph.
+- Python 3
+- Git
+- Mininet
+- Open vSwitch
+- OS-Ken
+- Required Python packages for the project
 
-```
-core_dpid   = switch with highest degree in the LINK graph (ties -> lowest dpid)
-Pf(flow)    = shortest path, over LINK graph, from flow's destination_dpid to core_dpid
-Lf(flow)    = { s in Pf(flow) : state(s) == Legacy }
-w(f)        = 0.5*criticality + 0.3*security_sla + 0.2*latency_sla
-security(f) = min(state(s) for s in Pf(f))     # Legacy=0, Hybrid=1 — weakest link, not an average
-C           = sum(w(f) * security(f) for f in F)
-```
+Mininet and Open vSwitch require appropriate system privileges and installation.
 
-**State ownership** (nobody but the designated owner writes state):
-- `optimizer.py` — reads state, never writes it.
-- `migrate_link.py` — the *only* module that sets a switch to `"Hybrid"`, after a verified handshake.
-- `monitor.py` — the *only* module that reverts a switch to `"Legacy"` on rollback.
-- `coverage.py` — read-only, never mutates state.
+## Getting Started
 
-**No-hardcode rule**: `topology.py` contains zero switch names, dpids, or counts written
-literally — everything comes from `topo_api.get_all_switch()`/`get_all_link()` live.
-
-## Setup
+### 1. Clone the repository
 
 ```bash
-sudo apt install mininet openvswitch-switch python3-os-ken
-python3 -m pip install networkx matplotlib
-
-cd migration && ./gen_certs.sh   # generates the cert chain topo.py and osken-manager both need
-```
-
-## Running it
-
-**Terminal 1 — controller, leave running:**
-```bash
+git clone <YOUR_REPOSITORY_URL>
 cd Migration-Orchestrator
-sudo osken-manager --observe-links \
-  --ctl-privkey migration/certs/controller.key \
-  --ctl-cert migration/certs/controller.cert \
-  --ca-certs migration/certs/ca.cert \
-  network/topology.py \
-  controller/simple_l2_switch.py
 ```
 
-**Terminal 2 — Mininet:**
+Replace `<YOUR_REPOSITORY_URL>` with the repository's Git URL.
+
+### 2. Switch to the monitor branch
+
 ```bash
-cd Migration-Orchestrator/network
-sudo python3 topo.py
-# exit cleanly with `exit`, never Ctrl+C — leftover state needs `sudo mn -c` to clean up
+git checkout monitor
 ```
 
-**Terminal 3 — verification:**
+### 3. Create and activate a Python virtual environment
+
 ```bash
-sudo ovs-vsctl show                                       # look for is_connected: true
-for s in s0 s1 s2 s3 s4 s5 s6; do echo -n "$s: "; sudo ovs-vsctl get bridge $s datapath_id; done
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-**Standalone `coverage.py` test** (no Mininet/OS-Ken needed):
+If the project has a `requirements.txt` file, install its dependencies:
+
 ```bash
-cd network && python3 coverage.py
+pip install -r requirements.txt
 ```
 
-## Known issues / open items
+Install any system-level dependencies required by Mininet, Open vSwitch, and OS-Ken according to the project's environment.
 
-- **`optimizer.py` imports dead function names.** It currently does
-  `from coverage import total_coverage, get_path_links, flow_weight` — but `coverage.py`
-  only exposes `compute_coverage`, `compute_path`, `compute_legacy_set`, `compute_gain`,
-  `flow_weight`. This will `ImportError` immediately. Needs Person B to update to the
-  frozen §5.3 names before optimizer/coverage integration can be tested end-to-end.
-- **`s0`'s dpid must be pinned explicitly in `topo.py`.** OVS treats an all-zero
-  `datapath-id` as "unset" and silently self-assigns a MAC-derived one instead, which
-  isn't guaranteed stable across reboots. Fix: `dpid='0000000000000010'` on `s0`'s
-  `net.addSwitch()` call (any nonzero value works — just not `...0000`). `s1`–`s6` are
-  fine as-is since their trailing-digit-derived dpids are already nonzero.
-- **`simple_l2_switch.py` must ignore LLDP frames.** Without an early
-  `if eth.ethertype == ether_types.ETH_TYPE_LLDP: return` in the packet-in handler, the
-  learning switch floods OS-Ken's topology-discovery probes like ordinary traffic,
-  causing `topology.py` to discover a near-full-mesh of phantom links instead of the
-  real ~7-link topology. Confirmed live: link count climbed toward C(7,2)=21 before the
-  fix.
-- **Monitoring implementation is present:** `monitor.py` supports read-only connectivity observation, injected health metrics, health reports, and non-executing recovery decisions. Live latency/failure-rate telemetry and automatic recovery orchestration remain incomplete.
-- **STP means the discovered graph can legitimately vary between runs** (7 links vs. 6,
-  depending on which redundant leg STP blocks) — this is expected behavior, not a bug;
-  `coverage.py`'s functions are topology-agnostic by design and were verified correct
-  against both converged shapes.
+## Running the Integrated Demonstration
 
-## Team / ownership
+From the repository root:
 
-| Area | Owner | File(s) |
-|---|---|---|
-| Control-plane graph + weakest-link coverage math | Person A | `network/topology.py`, `network/coverage.py` |
-| Greedy migration selection (SGBM) | Person B | `optimizer/optimizer.py`, `optimizer/capability_tracker.py` |
-| Mininet topology, Guarded Migration Execution | Person C | `network/topo.py`, `migration/migrate_link.py` |
-| Degradation monitoring, rollback, audit ledger | Person D | `monitor.py`, `ledger.py` |
+```bash
+chmod +x run_qsmo_demo.sh
+./run_qsmo_demo.sh
+```
 
-See `QSMO_Implementation_Guide.docx` for the full spec this repo implements against.****
+The launcher prepares and starts the integrated demonstration. It may request elevated privileges for networking and controller operations.
+
+Follow the terminal output and wait for the demonstration's final result.
+
+The successful integrated run reports:
+
+```text
+INTEGRATED LIVE SGBM + MONITOR + AUTOMATIC ROLLBACK PASSED
+```
+
+The exact output depends on the environment and test execution.
+
+## Demonstration Workflow
+
+The integrated workflow includes:
+
+1. Initialize the Mininet topology and controller application.
+2. Check the initial Legacy controller connections.
+3. Migrate the selected switches into Hybrid mode.
+4. Verify Hybrid controller connectivity.
+5. Run health-monitoring observations.
+6. Trigger automatic rollback when the configured demonstration conditions are met.
+7. Verify that the switches return to Legacy mode.
+8. Inspect migration outcomes and the migration ledger.
+9. Validate host reachability using Mininet.
+
+## Network Connectivity Test
+
+When the Mininet CLI is available, run:
+
+```text
+mininet> pingall
+```
+
+A successful demonstration should report no dropped packets for the tested topology.
+
+To leave the Mininet CLI:
+
+```text
+mininet> exit
+```
+
+## Monitoring and Test Data
+
+**Important:** The integrated rollback demonstration uses deliberately injected synthetic health metrics to exercise the recovery workflow.
+
+The demonstrated values include:
+
+- Latency: 1000 ms
+- Failure rate: 0.50
+- Configured latency threshold: 100 ms
+- Configured failure-rate threshold: 0.10
+
+These are controlled demonstration inputs, not claims of measurements from a production network or live physical infrastructure.
+
+## Testing
+
+The repository contains integration and monitoring tests under `tests/`.
+
+Examples of test areas include:
+
+- Live SGBM migration workflow
+- Multi-switch migration
+- BBM rollback behavior
+- Live monitoring observations
+- Topology optimization integration
+
+Run tests from the repository root using the project's test runner and the test modules available in `tests/`.
+
+For example:
+
+```bash
+python3 -m pytest tests/
+```
+
+Some integration tests may require Mininet, Open vSwitch, OS-Ken, elevated privileges, or a configured test environment.
+
+## Results and Validation
+
+The integrated demonstration has previously completed the following checks:
+
+- 7 of 7 switches connected during initial preflight.
+- Switches s1, s2, and s5 migrated to Hybrid mode.
+- Hybrid connectivity and verification samples completed.
+- Health conditions triggered automatic rollback.
+- The selected switches returned to Legacy mode.
+- Migration ledger recorded successful migration and rollback outcomes.
+- Mininet reported 56 of 56 ping responses received, with 0% packet loss.
+
+These results describe the demonstrated test run and are not a guarantee for every machine or execution.
+
+## Logs
+
+The demonstration launcher writes a timestamped log under the user's home directory.
+
+Review the log for:
+
+- Controller startup
+- Switch connection status
+- Migration events
+- Monitoring observations
+- Rollback decisions
+- Final verification results
+
+## Limitations
+
+- The project is demonstrated in an emulated Mininet environment.
+- Synthetic monitoring inputs are used to exercise automatic recovery.
+- Results depend on installed dependencies, system configuration, and runtime conditions.
+- Successful emulation does not by itself establish production-network performance or security.
+
+## Future Improvements
+
+- Expand automated test coverage.
+- Add configurable monitoring profiles.
+- Improve structured logging and experiment result export.
+- Evaluate the workflow with additional topology sizes and failure scenarios.
+- Validate behavior under more realistic network measurements.
+
+## Disclaimer
+
+This project is intended for research, development, and controlled demonstration. Validate configuration and operational behavior before using it in any real network.
+
+---

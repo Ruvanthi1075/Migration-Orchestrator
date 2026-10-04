@@ -62,6 +62,12 @@ class SimpleL2Switch(OSKenApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+
+        # LLDP is reserved for OS-Ken topology discovery.
+        # Do not learn or flood LLDP as ordinary Ethernet traffic.
+        if eth.ethertype == 0x88cc:
+            return
+
         dst = eth.dst
         src = eth.src
 

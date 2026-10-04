@@ -70,13 +70,11 @@ from os_ken.lib import hub
 # ---------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parents[1]
-OPTIMIZER_DIR = ROOT / "optimizer"
 
 for _p in (
     ROOT,
     ROOT / "network",
     ROOT / "migration",
-    OPTIMIZER_DIR,
 ):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -90,7 +88,7 @@ from optimizer import (
     supermodular_degree,
     sgbm_approx_ratio,
 )
-from capability_tracker import CapabilityTracker
+from optimizer.capability_tracker import CapabilityTracker
 
 
 # ---------------------------------------------------------------------

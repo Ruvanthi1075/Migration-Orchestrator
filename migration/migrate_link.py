@@ -850,25 +850,46 @@ class MigrationExecutor:
         )
 
     def _controller_target_connected(self, switch_name: str, target: str) -> bool:
-        """
-        Check the connection state of one specific OVS Controller target.
-
-        This is deliberately a per-target check rather than a bridge-wide
-        aggregate. During B-B-M migration the controller set contains only
-        the target being tested, so this directly answers whether the
-        actual Hybrid OVS connection is established.
-
-        `find Controller target=...` is scoped to the whole OVSDB, not to
-        one bridge; that is fine because the Hybrid target contains a
-        per-switch local port, so targets are unique between switches.
-        (switch_name is kept for a descriptive call interface.)
-        """
-        rc, out, _err = self.runner.run(
-            ["ovs-vsctl", "--bare", "--columns=is_connected", "find", "Controller",
-             f'target="{target}"'],
+        """Verify the expected controller connection on this bridge only."""
+        controller_rc, controller_out, _err = self.runner.run(
+            ["ovs-vsctl", "--bare", "get", "Bridge",
+             switch_name, "controller"],
             timeout=self.handshake_probe_timeout,
         )
-        return rc == 0 and out.strip().lower() == "true"
+
+        if controller_rc != 0:
+            return False
+
+        controller_ids = re.findall(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{12}",
+            controller_out,
+        )
+
+        for controller_id in controller_ids:
+            rc_target, actual_target, _err = self.runner.run(
+                ["ovs-vsctl", "--bare", "get", "Controller",
+                 controller_id, "target"],
+                timeout=self.handshake_probe_timeout,
+            )
+
+            if rc_target != 0:
+                continue
+
+            if actual_target.strip().strip('"') != target:
+                continue
+
+            rc_connected, connected_out, _err = self.runner.run(
+                ["ovs-vsctl", "--bare", "get", "Controller",
+                 controller_id, "is_connected"],
+                timeout=self.handshake_probe_timeout,
+            )
+
+            if rc_connected == 0 and connected_out.strip().lower() == "true":
+                return True
+
+        return False
 
     def _revert_to_legacy_only(self, switch_name: str, legacy_target: str):
         rc, out, err = self._set_controller_target(switch_name, legacy_target)
