@@ -62,6 +62,7 @@ class MigrationLedger:
         outcome: str,
         reason: str | None = None,
         associated_flows: list[str] | None = None,
+        recovery_latency_ms: float | None = None,
     ) -> None:
         """Append one record. Matches Algorithm 5 / guide §5.5 exactly.
 
@@ -83,6 +84,7 @@ class MigrationLedger:
             "outcome": outcome,
             "reason": reason,
             "associated_flows": list(associated_flows) if associated_flows else [],
+            "recovery_latency_ms": recovery_latency_ms,
         })
 
     def get_history(self, dpid: str) -> list[dict]:

@@ -1,20 +1,21 @@
 """Integrated live SGBM -> BBM -> monitoring -> automatic rollback demo.
 
-Load through osken-manager with Mininet already running. This is a controlled
-DEMO: metric values are explicitly injected to exercise the configured
-three-consecutive-observation rollback policy. OVS connectivity and migration /
-rollback execution remain live and are verified against OVS and TopologyAdapter.
+Load through osken-manager with Mininet already running. This is a
+controlled live demo: latency and connectivity telemetry come from the real
+OS-Ken OpenFlow Echo probe and live OVS state. No degraded metric values are
+injected. The monitor runs continuously until the demo is stopped.
 
 Safety: requires a connected seven-switch topology with every switch Legacy-only
 at startup. It migrates a budget-selected batch, monitors every successful
-Hybrid switch, then exercises automatic rollback for each using injected degraded
-metrics. On success all switches return to Legacy before executor shutdown.
+Hybrid switch continuously, and applies automatic rollback only when the real
+monitoring policy detects repeated measured degradation.
 """
 import os
 import sys
 import time
 import threading
 import traceback
+import signal
 
 import networkx as nx
 from os_ken.base import app_manager
@@ -34,6 +35,22 @@ from network.coverage import compute_coverage, compute_path
 
 class LiveSGBMOrchestratedDemo(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    @staticmethod
+    def _find_echo_probe():
+        """Find the live QSMO OpenFlow Echo probe loaded by OS-Ken."""
+        for name, app in app_manager.AppManager.get_instance().applications.items():
+            if (
+                callable(getattr(app, "probe", None))
+                and callable(getattr(app, "datapath_ids", None))
+            ):
+                print(f"Using live Echo probe app: {name}", flush=True)
+                return app
+
+        raise RuntimeError(
+            "Live QSMO Echo probe not found. "
+            "Make sure controller/qsmo_echo_probe.py is loaded."
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -76,104 +93,310 @@ class LiveSGBMOrchestratedDemo(app_manager.OSKenApp):
         try:
             print("\n" + "=" * 68 + "\n  QSMO | HYBRID CONTROLLER MIGRATION\n  SGBM + BBM  |  HEALTH MONITORING  |  AUTOMATIC RECOVERY\n" + "=" * 68, flush=True)
             topology = self._find_topology()
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline:
+
+            # ----------------------------------------------------------
+            # WAIT FOR COMPLETE LIVE TOPOLOGY DISCOVERY
+            # ----------------------------------------------------------
+            # OS-Ken discovers switches and LLDP links asynchronously.
+            # Do not build flows until the expected seven-switch topology
+            # is fully discovered and connected.
+            topology_deadline = time.monotonic() + 60.0
+
+            while time.monotonic() < topology_deadline:
                 graph = topology.get_graph()
-                if graph.number_of_nodes() == 7 and graph.number_of_edges() >= 6:
+
+                if (
+                    graph.number_of_nodes() == 7
+                    and graph.number_of_edges() >= 6
+                    and nx.is_connected(graph)
+                ):
                     break
+
                 print(
-                    f"Waiting for topology: {graph.number_of_nodes()}/7 switches, "
-                    f"{graph.number_of_edges()} links", flush=True
+                    f"Waiting for topology: "
+                    f"{graph.number_of_nodes()}/7 switches, "
+                    f"{graph.number_of_edges()} links",
+                    flush=True,
                 )
-                time.sleep(1)
+                time.sleep(1.0)
 
             graph = topology.get_graph()
-            if graph.number_of_nodes() != 7 or not nx.is_connected(graph):
+
+            if (
+                graph.number_of_nodes() != 7
+                or graph.number_of_edges() < 6
+                or not nx.is_connected(graph)
+            ):
                 raise RuntimeError(
-                    f"Preflight requires connected 7-switch graph; got "
-                    f"{graph.number_of_nodes()} nodes / {graph.number_of_edges()} edges"
-                )
-            nonlegacy = [d for d in graph.nodes if topology.get_state(d) != "Legacy"]
-            if nonlegacy:
-                raise RuntimeError(
-                    f"Safety stop: all switches must start Legacy; non-Legacy={nonlegacy}"
+                    "Preflight requires connected 7-switch topology; "
+                    f"got {graph.number_of_nodes()} nodes / "
+                    f"{graph.number_of_edges()} edges"
                 )
 
-            ledger = MigrationLedger()
-            self.executor = MigrationExecutor(topology, ledger, verbose=True)
-            legacy_target = f"ssl:{self.executor.controller_ip}:{self.executor.legacy_port}"
+            # ----------------------------------------------------------
+            # PHASE 0: LIVE OPENFLOW ECHO PROBE PRECHECK
+            # ----------------------------------------------------------
+            print(
+                "\nPHASE 0: Connecting to live OS-Ken Echo probe",
+                flush=True,
+            )
 
-            # OVS may report the full LLDP topology before every TLS/OpenFlow
-            # controller session has completed reconnecting. Wait boundedly for
-            # every bridge to be Legacy-only AND connected; never bypass the
-            # connection safety check.
-            bridge_by_dpid = {
-                dpid: self.executor._resolve_switch_name(dpid)
-                for dpid in graph.nodes
-            }
-            readiness_deadline = time.monotonic() + 60.0
-            last_readiness = {}
-            last_print = 0.0
-            while True:
-                all_ready = True
-                last_readiness = {}
-                for dpid, bridge in bridge_by_dpid.items():
-                    rc, targets_out, err = self.executor.runner.run(
-                        ["ovs-vsctl", "get-controller", bridge], timeout=5
-                    )
-                    targets = targets_out.split()
-                    connected = (
-                        rc == 0
-                        and targets == [legacy_target]
-                        and self.executor._controller_target_connected(bridge, legacy_target)
-                    )
-                    last_readiness[bridge] = {
-                        "rc": rc,
-                        "targets": targets,
-                        "connected": connected,
-                        "error": err.strip(),
-                    }
-                    if not connected:
-                        all_ready = False
+            echo_probe = self._find_echo_probe()
 
-                if all_ready:
+            echo_deadline = time.monotonic() + 60.0
+            successful_dpid = None
+            successful_result = None
+
+            while time.monotonic() < echo_deadline:
+                connected_dpids = list(echo_probe.datapath_ids())
+
+                if not connected_dpids:
                     print(
-                        "Preflight passed: all 7 bridges are Legacy-only and controller-connected.",
+                        "Waiting for OpenFlow datapaths to connect to Echo probe...",
+                        flush=True,
+                    )
+                    time.sleep(1.0)
+                    continue
+
+                print(
+                    f"Echo probe currently sees "
+                    f"{len(connected_dpids)} datapath(s): "
+                    f"{connected_dpids}",
+                    flush=True,
+                )
+
+                # A DPID can briefly appear before its datapath object is
+                # fully usable. Probe every currently known DPID and accept
+                # the first REAL successful Echo reply.
+                for dpid in connected_dpids:
+                    try:
+                        result = echo_probe.probe(dpid)
+                    except Exception as exc:
+                        print(
+                            f"Echo attempt failed for DPID={dpid}: {exc}",
+                            flush=True,
+                        )
+                        continue
+
+                    if result.get("ok"):
+                        successful_dpid = dpid
+                        successful_result = result
+                        break
+
+                    print(
+                        f"Echo not ready for DPID={dpid}: "
+                        f"{result.get('error')}",
+                        flush=True,
+                    )
+
+                if successful_dpid is not None:
+                    break
+
+                print(
+                    "No datapath has produced a successful Echo reply yet; "
+                    "waiting for switch connections to stabilize...",
+                    flush=True,
+                )
+                time.sleep(1.0)
+
+            if successful_dpid is None:
+                raise RuntimeError(
+                    "No live OpenFlow datapath produced a successful Echo "
+                    "reply within 60 seconds."
+                )
+
+            print(
+                f"REAL ECHO TEST | DPID={successful_dpid} | "
+                f"result={successful_result}",
+                flush=True,
+            )
+
+            print(
+                f"REAL ECHO SUCCESS | DPID={successful_dpid} | "
+                f"RTT={successful_result['latency_ms']:.3f} ms",
+                flush=True,
+            )
+
+            # Give the topology/controller connection set a short settling
+            # period before taking the full Legacy baseline.
+            time.sleep(2.0)
+
+            # ----------------------------------------------------------
+            # CREATE THE REAL MIGRATION EXECUTOR
+            # ----------------------------------------------------------
+            ledger = MigrationLedger()
+            self.executor = MigrationExecutor(
+                topology,
+                ledger,
+                verbose=True,
+            )
+
+            legacy_target = (
+                f"ssl:{self.executor.controller_ip}:"
+                f"{self.executor.legacy_port}"
+            )
+
+            print(
+                f"MigrationExecutor ready | Legacy target={legacy_target}",
+                flush=True,
+            )
+
+            # ----------------------------------------------------------
+            # BUILD LIVE TOPOLOGY GRAPH
+            # ----------------------------------------------------------
+            graph = self.executor.topology.get_graph()
+
+            if graph is None or len(graph.nodes()) == 0:
+                raise RuntimeError(
+                    "Live topology graph is empty; cannot perform "
+                    "Legacy controller readiness check."
+                )
+
+            print(
+                f"Live topology graph ready | "
+                f"nodes={len(graph.nodes())} | "
+                f"edges={len(graph.edges())}",
+                flush=True,
+            )
+
+            # ----------------------------------------------------------
+            # LEGACY CONTROLLER READINESS CHECK
+            # ----------------------------------------------------------
+            # Do not start the real baseline until every expected OVS
+            # bridge is connected to the Legacy OS-Ken controller.
+            bridge_by_dpid = {}
+
+            for dpid in sorted(graph.nodes()):
+                try:
+                    bridge = self.executor._resolve_switch_name(dpid)
+                    bridge_by_dpid[dpid] = bridge
+                except Exception as exc:
+                    print(
+                        f"WARNING: Could not resolve DPID {dpid} to bridge: {exc}",
+                        flush=True,
+                    )
+
+            expected_dpids = sorted(bridge_by_dpid.keys())
+
+            print(
+                "Checking Legacy controller readiness for "
+                f"{len(expected_dpids)} switches...",
+                flush=True,
+            )
+
+            readiness_deadline = time.time() + 30.0
+            last_readiness_error = None
+
+            while time.time() < readiness_deadline:
+                not_ready = []
+
+                for dpid, bridge in bridge_by_dpid.items():
+                    try:
+                        rc, stdout, stderr = self.executor.runner.run(
+                            ["ovs-vsctl", "get-controller", bridge],
+                            timeout=5,
+                        )
+
+                        target = stdout.strip()
+
+                        if rc != 0:
+                            not_ready.append(
+                                f"{bridge}(command-failed={stderr.strip() or rc})"
+                            )
+                            continue
+
+                        if target != legacy_target:
+                            not_ready.append(
+                                f"{bridge}(target={target or 'NONE'})"
+                            )
+                            continue
+
+                        connected = self.executor._controller_target_connected(
+                            bridge,
+                            legacy_target,
+                        )
+
+                        if not connected:
+                            not_ready.append(
+                                f"{bridge}(not-connected)"
+                            )
+
+                    except Exception as exc:
+                        last_readiness_error = exc
+                        not_ready.append(
+                            f"{bridge}(error={exc})"
+                        )
+
+                if not not_ready:
+                    print(
+                        "Legacy controller READY | "
+                        f"all {len(expected_dpids)} switches connected to "
+                        f"{legacy_target}",
                         flush=True,
                     )
                     break
 
-                now = time.monotonic()
-                if now >= readiness_deadline:
-                    raise RuntimeError(
-                        "Safety stop: Legacy controller readiness timed out after 60s; "
-                        f"per-bridge status={last_readiness}"
-                    )
-                if now - last_print >= 5.0:
-                    waiting = [
-                        bridge for bridge, status in last_readiness.items()
-                        if not status["connected"]
-                    ]
-                    print(
-                        "Waiting for Legacy controller connections on: "
-                        f"{waiting} (bounded timeout 60s)",
-                        flush=True,
-                    )
-                    last_print = now
-                time.sleep(0.5)
+                print(
+                    "Waiting for Legacy controller: "
+                    + ", ".join(not_ready),
+                    flush=True,
+                )
+                time.sleep(1.0)
+            else:
+                raise RuntimeError(
+                    "Legacy controller readiness timeout after 30 seconds. "
+                    f"Expected target={legacy_target}; "
+                    f"last_error={last_readiness_error}"
+                )
+
+            # ----------------------------------------------------------
+            # PHASE 1/4: REAL LEGACY BASELINE
+            # ----------------------------------------------------------
+            monitor = MigrationMonitor(
+                self.executor,
+                config=MonitorConfig(
+                    poll_interval=0.2,
+                    baseline_samples=30,
+                    warmup_samples=3,
+                    rolling_window=5,
+                    failure_window=10,
+                    failure_threshold=2,
+                    sigma_multiplier=3.0,
+                    min_latency_threshold_ms=5.0,
+                    consecutive_degraded_observations=3,
+                    degradation_threshold_percent=20.0,
+                ),
+                latency_probe=echo_probe.probe,
+            )
+
+            print(
+                "PHASE 1/4: Measuring REAL Legacy latency baseline "
+                "(30 probes/switch, discard 3 warm-up)",
+                flush=True,
+            )
+
+            legacy_baseline = monitor.capture_baseline()
+
+            for dpid, result in legacy_baseline.items():
+                print(
+                    f"  Legacy {result['switch']:<5} | "
+                    f"DPID={dpid} | "
+                    f"median={result['median_ms']:.3f} ms | "
+                    f"stddev={result['stddev_ms']:.3f} ms | "
+                    f"failures={result['failures']}/{result['attempt_count']}",
+                    flush=True,
+                )
 
             flows = self._build_flows(graph)
             capability = CapabilityTracker()
             beta = 0.50
-            total_cost = sum(capability.cost(d) for d in graph.nodes)
+            total_cost = sum(capability.cost(dpid) for dpid in graph.nodes())
             budget = beta * total_cost
-            initial_coverage = compute_coverage(graph, flows)
+
             print(
-                f"Preflight passed: switches=7, flows={len(flows)}, beta={beta:.2f}, "
-                f"budget={budget:.3f}, initial_coverage={initial_coverage:.3f}",
+                "PHASE 2/4: Running real SGBM selection and BBM migration",
                 flush=True,
             )
-            print("PHASE 1/3: Running real SGBM selection and BBM migration", flush=True)
             schedule, sgbm_coverage = run_sgbm(
                 graph, flows, budget, self.executor.migrate,
                 capability=capability, verbose=True,
@@ -192,87 +415,130 @@ class LiveSGBMOrchestratedDemo(app_manager.OSKenApp):
                 f"optimizer_coverage={sgbm_coverage:.3f}", flush=True
             )
 
-            # Explicitly labeled injected metrics exercise the policy. They are not
-            # claimed to be measured production telemetry.
             print(
-                "PHASE 2/3: Live OVS connectivity observations; controlled DEMO metric "
-                "injection enabled (latency=1000ms, failure_rate=0.50)", flush=True
-            )
-            monitor = MigrationMonitor(
-                self.executor,
-                config=MonitorConfig(
-                    poll_interval=0.2,
-                    latency_threshold_ms=100.0,
-                    failure_rate_threshold=0.10,
-                    consecutive_degraded_observations=3,
-                ),
-                metric_provider=lambda _dpid: {
-                    "latency_ms": 1000.0,
-                    "failure_rate": 0.50,
-                },
-            )
-
-            rollback_results = {}
-            for observation_no in range(1, 4):
-                reports = monitor.monitor_once()
-                by_dpid = {r.get("dpid"): r for r in reports}
-                for dpid in migrated:
-                    report = by_dpid.get(dpid)
-                    if report is None:
-                        # A switch already rolled back must not reappear as Hybrid.
-                        if observation_no < 3 or topology.get_state(dpid) != "Legacy":
-                            raise AssertionError(
-                                f"Monitor omitted still-Hybrid switch {dpid}: {reports}"
-                            )
-                        continue
-                    print(
-                        f"  {self.executor._resolve_switch_name(dpid):<5} | "
-                        f"Sample {observation_no}/3 | "
-                        f"Health: {report['status'].upper():<9} | "
-                        f"Latency: {report.get('latency_ms')} ms | "
-                        f"Failure: {report.get('failure_rate', 0) * 100:.0f}% | "
-                        f"Recovery: {report.get('recovery', {}).get('outcome', 'Monitoring').upper()}", flush=True
-                    )
-                    if report.get("recovery"):
-                        rollback_results[dpid] = report["recovery"]
-                if observation_no < 3:
-                    for dpid in migrated:
-                        if topology.get_state(dpid) != "Hybrid":
-                            raise AssertionError(
-                                f"{dpid} rolled back before third degraded observation"
-                            )
-
-            print("PHASE 3/3: Verifying actual Legacy rollback and shared ledger", flush=True)
-            for dpid in migrated:
-                if topology.get_state(dpid) != "Legacy":
-                    raise AssertionError(f"Rollback did not restore topology state for {dpid}")
-                bridge = self.executor._resolve_switch_name(dpid)
-                if not self.executor._controller_target_connected(bridge, legacy_target):
-                    raise AssertionError(f"Legacy SSL connection not verified for {bridge}")
-                outcomes = [event["outcome"] for event in ledger.get_history(dpid)]
-                if outcomes != ["success", "reverted"]:
-                    raise AssertionError(f"Unexpected ledger outcomes for {dpid}: {outcomes}")
-                if rollback_results.get(dpid, {}).get("outcome") != "reverted":
-                    raise AssertionError(f"No successful automatic rollback report for {dpid}")
-                print(
-                    f"Verified {bridge}: OVS Legacy SSL connected, topology=Legacy, "
-                    f"ledger={outcomes}", flush=True
-                )
-
-            final_coverage = compute_coverage(topology.get_graph(), flows)
-            print("\nINTEGRATED LIVE SGBM + MONITOR + AUTOMATIC ROLLBACK PASSED", flush=True)
-            print(
-                f"migrated_then_reverted={len(migrated)}; initial_coverage="
-                f"{initial_coverage:.3f}; migration_coverage={sgbm_coverage:.3f}; "
-                f"final_coverage={final_coverage:.3f}; rollback_rate="
-                f"{ledger.compute_rollback_rate():.3f}", flush=True
-            )
-            print(
-                "Metric trigger was controlled synthetic demo input; controller connectivity, "
-                "BBM cutovers, rollback targets, topology states, and ledger outcomes were live-verified.",
+                "PHASE 2/3: Measuring real post-migration Echo latency",
                 flush=True,
             )
-            print("Run `pingall` in Mininet for final data-plane validation.", flush=True)
+            # IMPORTANT: keep the same MigrationMonitor instance used for
+            # the Legacy baseline.  Its per-DPID Legacy baselines must remain
+            # available for the Hybrid comparison and later monitoring.
+            print(
+                "Capturing real Hybrid post-migration latency baseline...",
+                flush=True,
+            )
+            deadline = time.time() + 10.0
+            missing = list(migrated)
+
+            while missing and time.time() < deadline:
+                connected = set(echo_probe.datapath_ids())
+                missing = [
+                    dpid for dpid in migrated
+                    if int(str(dpid), 16) not in connected
+                ]
+                if missing:
+                    print(
+                        f"Waiting for Echo probe reconnection: {missing}",
+                        flush=True,
+                    )
+                    time.sleep(0.2)
+
+            if missing:
+                raise RuntimeError(
+                    f"Hybrid switches not visible to Echo probe after migration: {missing}"
+                )
+
+            monitor.capture_post_migration(migrated)
+
+            print(
+                "\nPHASE 4/4: Continuous live health monitoring",
+                flush=True,
+            )
+            print(
+                f"Monitoring every {monitor.config.poll_interval:.3f}s | "
+                f"rolling window={monitor.config.rolling_window} | "
+                f"degradation threshold={monitor.config.degradation_threshold_percent:.1f}% | "
+                f"rollback after {monitor.config.consecutive_degraded_observations} "
+                "consecutive degraded cycles",
+                flush=True,
+            )
+            print(
+                "Monitoring remains active until this demo process is stopped "
+                "(Ctrl+C). All telemetry is real OpenFlow Echo/OVS state.",
+                flush=True,
+            )
+
+            # The monitor owns the periodic polling loop. Do not manually call
+            # monitor_once() here: that would turn continuous monitoring into
+            # a fixed number of immediate observations and would prevent the
+            # configured rolling window / poll interval from operating normally.
+            monitor.start()
+
+            def handle_shutdown(signum, frame):
+                print("\n\nStopping live monitoring...", flush=True)
+
+                try:
+                    monitor.stop(timeout=5.0)
+
+                    print("\nFinal migration report:", flush=True)
+                    monitor.log_migration_report()
+
+                    report_dir = os.path.join(ROOT, "reports")
+                    os.makedirs(report_dir, exist_ok=True)
+
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    report_path = os.path.join(
+                        report_dir,
+                        f"qsmo_migration_report_{timestamp}.txt",
+                    )
+
+                    monitor.write_text_report(report_path)
+
+                    print(
+                        f"Final migration report saved to: {report_path}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"Warning: final report generation failed: {exc}",
+                        flush=True,
+                    )
+
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGINT, handle_shutdown)
+            signal.signal(signal.SIGTERM, handle_shutdown)
+
+            # Keep this demo worker alive for as long as the user wants the
+            # live monitoring session to run. Ctrl+C terminates the OS-Ken
+            # process; the monitor itself is a daemon thread owned by the app.
+            try:
+                while True:
+                    time.sleep(1.0)
+            except KeyboardInterrupt:
+                print("\n\nStopping live monitoring...", flush=True)
+
+                monitor.stop(timeout=5.0)
+
+                print("\nFinal migration report:", flush=True)
+                monitor.log_migration_report()
+
+                report_dir = os.path.join(ROOT, "reports")
+                os.makedirs(report_dir, exist_ok=True)
+
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                report_path = os.path.join(
+                    report_dir,
+                    f"qsmo_migration_report_{timestamp}.txt",
+                )
+
+                monitor.write_text_report(report_path)
+
+                print(
+                    f"Final migration report saved to: {report_path}",
+                    flush=True,
+                )
+
+                should_shutdown = True
 
         except Exception as exc:
             print(
@@ -299,8 +565,40 @@ class LiveSGBMOrchestratedDemo(app_manager.OSKenApp):
                 except Exception:
                     should_shutdown = False
         finally:
+            # Always stop live monitoring and save the final report on shutdown.
+            try:
+                if "monitor" in locals() and monitor is not None:
+                    monitor.stop(timeout=5.0)
+
+                    print("\nFinal migration report:", flush=True)
+                    monitor.log_migration_report()
+
+                    report_dir = os.path.join(ROOT, "reports")
+                    os.makedirs(report_dir, exist_ok=True)
+
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    report_path = os.path.join(
+                        report_dir,
+                        f"qsmo_migration_report_{timestamp}.txt",
+                    )
+
+                    monitor.write_text_report(report_path)
+
+                    print(
+                        f"Final migration report saved to: {report_path}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    f"Warning: final report generation failed: {exc}",
+                    flush=True,
+                )
+
             if self.executor is not None and should_shutdown:
                 try:
                     self.executor.shutdown()
                 except Exception as exc:
-                    print(f"Warning: executor.shutdown() failed: {exc}", flush=True)
+                    print(
+                        f"Warning: executor.shutdown() failed: {exc}",
+                        flush=True,
+                    )
