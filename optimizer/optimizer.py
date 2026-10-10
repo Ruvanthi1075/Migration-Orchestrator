@@ -1,168 +1,546 @@
 """
 optimizer.py
-Feature 3: Greedy Migration Order Optimizer
+Feature 3 -- Supermodular-Aware Greedy Batch Migration, SGBM (Person B)
 
-At each round, tests every remaining Legacy link, measures how much
-total_coverage() (Feature 2) would improve if that single link were
-upgraded to Hybrid, and actually upgrades whichever link gives the
-biggest improvement. Ties are broken using Feature 5's capability
-track record.
+CORRECTED MODEL (see QSMO_Implementation_Guide.docx, sections 2, 5.3, 7.2)
+----------------------------------------------------------------------------
+The control-plane channel is a single out-of-band hop per switch, so
+the migration target is a SWITCH (a dpid), not a link/edge, and state
+lives on graph NODES, not edges:
 
-This is a greedy algorithm over a submodular set function (weakest-
-link coverage), which is why greedy selection is a defensible choice
-here rather than an arbitrary heuristic (Nemhauser, Wolsey & Fisher,
-1978): greedy is guaranteed to reach at least ~63% of the optimal
-achievable coverage.
+    core_dpid = highest-degree node in G (ties -> lowest dpid)
+    Pf(flow)  = shortest path over G from flow["destination_dpid"] to core_dpid
+    Lf(flow)  = the subset of Pf(flow) still in "Legacy" state
+    w(f)      = 0.5*criticality + 0.3*security_sla + 0.2*latency_sla
+    C         = sum(w(f) * security(f) for f in flows)
+
+LITERATURE-BACKED REFORMULATION (see SGBM_Literature_Backed_Formulation.docx,
+sections 5.3 and 6.1 -- supersedes the earlier invented constants)
+----------------------------------------------------------------------------
+Two numbers used by this module were previously unsourced and have been
+replaced:
+
+  score(f) = gain(f) / cost(Lf(f))^alpha,  alpha = 1  (Sec. 6.1, Alg. 1 line 11)
+      Plain gain/cost (alpha=1), not alpha=0.5. This is the exact
+      cost-effectiveness greedy rule proven to reach 1/2*(1-1/e) on a
+      single knapsack constraint over a coverage-type objective
+      [Khuller, Moss, Naor, "The Budgeted Maximum Coverage Problem",
+      IPL 70(1), 1999], and used identically (also alpha=1) in CELF
+      [Leskovec et al., KDD 2007]. alpha=0.5 had no citation and is
+      withdrawn.
+
+  progress(s) = [sum(w(f)/len(Lf(f)) for f in F if s in Lf(f))] / cost(s)^alpha,
+      alpha = 1 (Sec. 6.2, Alg. 1 lines 18-24, fallback branch)
+      Same alpha as 6.1 for consistency. Note (stated in the doc,
+      Sec. 6.2): this fallback is a heuristic proxy for true marginal
+      gain, so the 6.1 guarantee does not automatically transfer to it;
+      it remains empirically validated only (Table I / Fig. 2), not
+      proven.
+
+  sgbm_approx_ratio(G, flows) = 1 - e^(-1/(d+1))  (Sec. 5.2-5.3)
+      The structural bound for a monotone supermodular function with
+      supermodular degree d under a cardinality-style constraint
+      [Feldman & Izsak, "Constrained Monotone Function Maximization and
+      the Supermodular Degree", APPROX/RANDOM 2014, arXiv:1407.6328;
+      improves the 1/(d+1) bound of Feige & Izsak, ITCS 2013]. The
+      previously used rho = 1/(2*(d+1)+1) had no source and is
+      withdrawn. d itself is also corrected here to the
+      Feige-Izsak/Feldman-Izsak definition -- the union of per-flow
+      path dependencies at a switch, not just the single longest flow
+      path (see supermodular_degree() below).
+
+      Stated scope limitation (Sec. 5.3, carried through here rather
+      than hidden): this ratio is proved for a cardinality/
+      k-extendible-system constraint, not SGBM's heterogeneous
+      per-switch budget B. A knapsack-tight bound for this AND
+      (weakest-link) objective is, to our knowledge, open in the
+      literature -- curvature/submodularity-ratio machinery degenerates
+      here because f({s}) = 0 for any switch that does not by itself
+      complete a flow's path. The budget-constrained regime is instead
+      validated empirically (Table I / Fig. 2), which is the documented
+      stand-in for the missing knapsack-tight proof.
+
+This is a rewrite of a stale pre-correction draft that imported
+`total_coverage` / `get_path_links` from coverage.py and read/wrote
+`graph.edges[a, b]["state"]` -- none of which exist in Person A's
+actual, corrected coverage.py / topology.py (Feature 1/2 use
+`compute_coverage`, `compute_path`, `compute_legacy_set`,
+`compute_gain`, and `G.nodes[dpid]["state"]`). Importing the old file
+against the real Feature 1/2 modules raised ImportError immediately.
+This file is written against the frozen contract in guide section 5.3
+and imports Person A's coverage.py directly -- nothing here recomputes
+a shortest path or a coverage score on its own.
+
+State ownership rule (guide section 2.3): this module NEVER writes
+switch state directly outside of the in-memory bookkeeping needed to
+run the loop against a graph it was handed. In the real wiring
+(orchestrator_main.py), the caller is expected to pass a `migrate_fn`
+that is Feature 4's `migrate_link.migrate`, and the actual
+Legacy->Hybrid transition of record lives in topology.set_state(),
+called by migrate_link.py on a verified success -- this module only
+mirrors that transition onto its own graph object's node attribute so
+the next round of the loop sees an up-to-date Lf(f), exactly as
+Algorithm 1's pseudocode does.
+
+Interface (guide section 7.2, frozen):
+    run_sgbm(G, flows, budget, migrate_fn, capability) -> (schedule, coverage)
+
+    migrate_fn(dpid) -> dict shaped per guide section 5.4:
+        {"dpid": str, "outcome": "success"|"failed",
+         "baseline": {...}, "post": {...} | None, "timestamp": iso8601 str}
 """
 
+import math
 import os
 import sys
 
 # network/ holds topology.py and coverage.py (Feature 1/2). optimizer/
 # is a sibling folder, so make network/ importable without needing a
-# package/__init__.py setup, matching this repo's flat-script style.
+# package/__init__.py setup, matching this repo's flat-script style
+# (same pattern the pre-correction draft used, kept because it's
+# still correct -- only the imported names below have changed).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "network"))
 
-from coverage import total_coverage
-from capability_tracker import CapabilityTracker, link_device_type
+from coverage import (  # noqa: E402
+    compute_coverage,
+    compute_path,
+    compute_legacy_set,
+    compute_gain,
+    flow_weight,
+    core_switch,
+)
+from optimizer.capability_tracker import CapabilityTracker, COST_FLOOR  # noqa: E402
+
+# alpha for score(f) and progress(s), Sec. 6.1/6.2 of
+# SGBM_Literature_Backed_Formulation.docx. alpha=1 is the value with a
+# citation (Khuller-Moss-Naor / CELF); change only with a matching
+# citation, and update the module docstring above if you do.
+# Float tolerance for "does this batch fit in the remaining budget?". Without it,
+# repeated subtraction can leave the budget ~1e-16 short of the last switch's cost,
+# so beta=1.0 silently leaves one Legacy switch behind on some topologies.
+BUDGET_EPS = 1e-9
+
+SCORE_ALPHA = 1
 
 
-def get_legacy_links(graph):
-    """All links currently in the Legacy state, as (a, b) tuples."""
-    return [
-        (a, b) for a, b, data in graph.edges(data=True)
-        if data["state"] == "Legacy"
-    ]
+# ---------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------
+
+def get_legacy_switches(G):
+    """All dpids currently in the Legacy state."""
+    return [n for n in G.nodes if G.nodes[n]["state"] == "Legacy"]
 
 
-def marginal_gain(graph, flows, link):
+def supermodular_degree(G, flows):
     """
-    How much total_coverage() would improve if `link` were upgraded
-    to Hybrid, without permanently changing the graph. Side-effect
-    free: the link's state is always restored before returning, so
-    Feature 3 can safely call this once per candidate per round.
+    Measured supermodular degree d for this topology + flow set, per
+    the Feige-Izsak / Feldman-Izsak definition (reformulation doc,
+    Sec. 5.2):
+
+        d = max_{s in V} | union_{f : s in Pf(f)} (Pf(f) \\ {s}) |
+
+    i.e. for each switch s, take the union (not the max) of every
+    flow-path-minus-s across every flow whose path includes s, then
+    take the largest such set over all switches. This corrects the
+    earlier max_f(|Pf|-1) definition, which undercounts whenever a
+    switch lies on more than one flow's path -- the normal case here,
+    since every Pf terminates at the shared core switch.
     """
-    a, b = link
-    baseline = total_coverage(graph, flows)
+    deps = {}
+    for f in flows:
+        path = compute_path(G, f)
+        path_set = set(path)
+        for s in path:
+            deps.setdefault(s, set()).update(path_set - {s})
+    if not deps:
+        return 0
+    return max(len(dep_set) for dep_set in deps.values())
 
-    original_state = graph.edges[a, b]["state"]
-    graph.edges[a, b]["state"] = "Hybrid"
-    upgraded = total_coverage(graph, flows)
-    graph.edges[a, b]["state"] = original_state  # restore
 
-    return upgraded - baseline
-
-
-def pick_best_link(graph, flows, tracker=None):
+def sgbm_approx_ratio(G, flows):
     """
-    Returns (link, gain) for the single best Legacy link to migrate
-    next: the one with the highest marginal_gain. Ties are broken by
-    Feature 5's capability track record (higher success rate wins);
-    if tracker is None the first candidate found at the best gain
-    wins.
+    Structural approximation ratio for SGBM's batch-selection branch,
+    per the reformulation doc Sec. 5.3:
 
-    Returns None if there are no Legacy links left.
+        rho_struct = 1 - e^(-1/(d+1))
+
+    [Feldman & Izsak, APPROX/RANDOM 2014 (arXiv:1407.6328), improving
+    the 1/(d+1) bound of Feige & Izsak, ITCS 2013], for a monotone
+    supermodular objective with supermodular degree d under a
+    cardinality-style constraint.
+
+    Scope limitation (stated, not hidden): this is proved for a
+    cardinality/k-extendible-system constraint, not SGBM's
+    heterogeneous per-switch budget B -- report it as the structural
+    guarantee under the idealized near-uniform-cost case, and rely on
+    the empirical budget-constrained comparison (Table I / Fig. 2) for
+    the general-cost regime, since a knapsack-tight bound for this
+    AND/weakest-link objective is, to our knowledge, open in the
+    literature (see module docstring).
     """
-    candidates = get_legacy_links(graph)
+    d = supermodular_degree(G, flows)
+    return 1.0 - math.exp(-1.0 / (d + 1))
+
+
+# ---------------------------------------------------------------------
+# Batch scoring (Algorithm 1, lines 6-16)
+# ---------------------------------------------------------------------
+
+def _batch_candidates(G, flows, budget, capability):
+    """
+    One candidate per flow that still has a non-empty, affordable
+    Legacy-set Lf(f): (flow, Lf(f), cost(Lf(f))). Mirrors Algorithm 1
+    line 8's Omega set.
+    """
+    candidates = []
+    for f in flows:
+        Lf = compute_legacy_set(G, f)
+        if not Lf:
+            continue
+        cost_Lf = sum(capability.cost(s) for s in Lf)
+        if cost_Lf <= budget + BUDGET_EPS:
+            candidates.append((f, Lf, cost_Lf))
+    return candidates
+
+
+def pick_best_batch(G, flows, budget, capability):
+    """
+    Among every flow whose full remaining-Legacy batch fits in
+    `budget`, return the one with the highest
+    score(f) = gain(f) / cost(Lf(f)) ** SCORE_ALPHA   (Algorithm 1,
+    lines 10-12; SCORE_ALPHA=1 per reformulation doc Sec. 6.1 --
+    plain gain/cost, citing Khuller-Moss-Naor / CELF).
+
+    gain(f) follows Sec. 4 exactly:
+        gain(f) = CoverageAfterMigrating(Lf(f)) - C
+    i.e. the TOTAL coverage added by migrating this candidate's batch,
+    including every OTHER flow that batch happens to complete (flows
+    sharing switches on their paths). compute_gain() returns a
+    per-flow dict, so it is evaluated once per candidate with
+    hypothetical = that candidate's own Lf and summed over all flows.
+    Scoring only the candidate's own entry (the previous behaviour)
+    undercounts shared batches -- the exact supermodular effect SGBM
+    exists to exploit.
+
+    Returns (flow, Lf, cost_Lf, gain) for the winning flow, or None if
+    no flow's full batch fits within `budget`.
+    """
+    candidates = _batch_candidates(G, flows, budget, capability)
     if not candidates:
         return None
 
-    best_link = None
-    best_gain = None
-    best_rate = None
+    scored = []
+    for f, Lf, cost_Lf in candidates:
+        gain = sum(compute_gain(G, flows, Lf).values())
+        scored.append((gain / (cost_Lf ** SCORE_ALPHA), f, Lf, cost_Lf, gain))
 
-    for link in candidates:
-        gain = marginal_gain(graph, flows, link)
-        rate = tracker.link_success_rate(*link) if tracker else 0.5
-
-        if best_gain is None or gain > best_gain:
-            best_link, best_gain, best_rate = link, gain, rate
-        elif gain == best_gain and rate > best_rate:
-            # tie on coverage gain -> prefer the device type with the
-            # better track record (Feature 5)
-            best_link, best_gain, best_rate = link, gain, rate
-
-    return best_link, best_gain
+    # max() keeps the first of equal scores -> deterministic given flow order.
+    _score, best_f, best_Lf, best_cost, best_gain = max(scored, key=lambda t: t[0])
+    return best_f, best_Lf, best_cost, best_gain
 
 
-def run_greedy_migration(graph, flows, tracker=None, budget=None, verbose=True):
+def _pick_progress_switch(G, flows, budget, capability):
     """
-    Repeatedly picks and migrates the single best Legacy link until
-    either `budget` links have been migrated this call, or no Legacy
-    links remain (whole network upgraded).
+    Fallback for when no flow's full batch fits the remaining budget
+    (Algorithm 1, lines 18-24): pick the single affordable Legacy
+    switch with the highest
+        progress(s) = (sum(w(f)/len(Lf(f)) for f in F if s in Lf(f)))
+                      / cost(s) ** SCORE_ALPHA
+    (SCORE_ALPHA=1, same as 6.1 for consistency -- reformulation doc
+    Sec. 6.2), i.e. partial credit toward every path `s` still blocks,
+    so leftover budget still moves the network toward completing its
+    highest-value paths instead of being wasted or left unspent.
 
-    tracker: a CapabilityTracker (Feature 5). If omitted, a fresh one
-    is created. This beginner-scope build has no Feature 6 rollback
-    yet, so every migration here is recorded as a success -- wire in
-    real pass/fail once Feature 6's threshold check exists.
+    Stated limitation (Sec. 6.2): this is a heuristic proxy for true
+    marginal gain, not the argmax of gain/cost itself, so the 6.1
+    cost-effectiveness guarantee does not automatically transfer to
+    this branch -- it is validated empirically only.
 
-    Returns a list of (link, gain) tuples in the order they were
-    migrated.
+    Returns (dpid, progress_score), or None if no Legacy switch fits
+    within `budget`.
     """
-    if tracker is None:
-        tracker = CapabilityTracker()
+    affordable = [s for s in get_legacy_switches(G) if capability.cost(s) <= budget + BUDGET_EPS]
+    if not affordable:
+        return None
 
-    history = []
-    round_num = 0
+    contribution = {}
+    for f in flows:
+        Lf = compute_legacy_set(G, f)
+        if not Lf:
+            continue
+        share = flow_weight(f) / len(Lf)
+        for s in Lf:
+            contribution[s] = contribution.get(s, 0.0) + share
 
-    while True:
-        if budget is not None and round_num >= budget:
-            break
+    def progress(s):
+        return contribution.get(s, 0.0) / (capability.cost(s) ** SCORE_ALPHA)
 
-        result = pick_best_link(graph, flows, tracker)
-        if result is None:
-            break  # every link already Hybrid
+    best = max(affordable, key=progress)
+    return best, progress(best)
 
-        link, gain = result
-        a, b = link
-        graph.edges[a, b]["state"] = "Hybrid"
-        tracker.record_link_attempt(a, b, success=True)
 
-        history.append((link, gain))
-        round_num += 1
+# ---------------------------------------------------------------------
+# Algorithm 1 -- Supermodular-Aware Greedy Batch Migration (SGBM)
+# ---------------------------------------------------------------------
+
+def run_sgbm(G, flows, budget, migrate_fn, capability=None, verbose=True):
+    """
+    Algorithm 1, corrected: "link" read as "switch", Pf/Lf/gain coming
+    from coverage.py (Person A), cost(s) coming from
+    CapabilityTracker.cost() (Person B, Feature 5) instead of a static
+    table, and every actual state transition delegated to `migrate_fn`
+    (Feature 4, Person C) -- this function never sets
+    G.nodes[s]["state"] on its own initiative outside of mirroring a
+    migrate_fn outcome, per the state ownership rule in guide 2.3 /
+    Algorithm 1 line 14.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        The live switch<->switch control-plane graph (topology.py's
+        get_graph(), or a hand-built fake graph for testing).
+    flows : list[dict]
+        As loaded by coverage.load_flows() -- each flow needs
+        "name", "destination_dpid", "criticality", "security_sla",
+        "latency_sla".
+    budget : float
+        Total migration budget for this run (Algorithm 1's B), in the
+        same units as capability.cost(s) (per-switch costs lie in
+        [0.259, 0.592] when calibrated). B is not derived here: sweep
+        it from the calling script as B = beta * sum(cost(s)), beta in
+        {0.25, 0.5, 0.75, 1.0} -- see optimizer/run_experiment.py.
+    migrate_fn : callable(dpid: str) -> dict
+        Per guide section 5.4. In production this is
+        migrate_link.migrate (Feature 4, Person C); for standalone
+        testing, pass a fake that always/sometimes returns
+        outcome="success" (see the __main__ block below and guide
+        7.2's integration note) -- the signature must not change when
+        swapping the real one in.
+    capability : CapabilityTracker, optional
+        Defaults to a fresh CapabilityTracker() if not supplied.
+
+    Returns
+    -------
+    (schedule, coverage) : (list[dict], float)
+        schedule is the flat list of every migrate_fn() result dict,
+        in call order. coverage is compute_coverage(G, flows) after
+        the run.
+    """
+    if capability is None:
+        capability = CapabilityTracker()
+
+    schedule = []
+    remaining = budget
+
+    while remaining > 0 and get_legacy_switches(G):
+        batch_pick = pick_best_batch(G, flows, remaining, capability)
+
+        if batch_pick is not None:
+            flow, Lf, cost_Lf, gain = batch_pick
+            for dpid in sorted(Lf):
+                result = migrate_fn(dpid)
+                capability.record(dpid, result["outcome"])
+                schedule.append(result)
+                if result["outcome"] == "success":
+                    G.nodes[dpid]["state"] = "Hybrid"
+                if verbose:
+                    print(
+                        f"  migrate {dpid} (batch for flow={flow['name']}) "
+                        f"-> {result['outcome']}"
+                    )
+            remaining -= cost_Lf
+            if verbose:
+                print(
+                    f"Round: completed flow={flow['name']} batch={sorted(Lf)} "
+                    f"gain=+{gain:.3f} cost={cost_Lf:.2f} "
+                    f"-> coverage={compute_coverage(G, flows):.3f}, "
+                    f"budget remaining={remaining:.2f}"
+                )
+            continue
+
+        # No flow's full batch fits -- spend the remainder one switch
+        # at a time via partial-progress scoring (Algorithm 1, else
+        # branch, lines 18-24).
+        fallback = _pick_progress_switch(G, flows, remaining, capability)
+        if fallback is None:
+            break  # nothing affordable left; stop rather than loop forever
+
+        dpid, prog = fallback
+        cost_before = capability.cost(dpid)  # charge the pre-attempt cost
+        result = migrate_fn(dpid)
+        capability.record(dpid, result["outcome"])
+        schedule.append(result)
+        if result["outcome"] == "success":
+            G.nodes[dpid]["state"] = "Hybrid"
+        remaining -= cost_before
 
         if verbose:
-            score = total_coverage(graph, flows)
             print(
-                f"Round {round_num}: migrated {a}-{b} "
-                f"(type={link_device_type(a, b)}, gain=+{gain}) "
-                f"-> total coverage = {score}"
+                f"Round (fallback): migrate {dpid} -> {result['outcome']} "
+                f"progress_score={prog:.3f} cost={cost_before:.2f} "
+                f"-> coverage={compute_coverage(G, flows):.3f}, "
+                f"budget remaining={remaining:.2f}"
             )
 
-    return history
+    return schedule, compute_coverage(G, flows)
 
 
 if __name__ == "__main__":
-    from topology import build_graph, PROJECT_TOPO
-    from coverage import load_flows
+    # ------------------------------------------------------------------
+    # Self-test against a HAND-BUILT graph, not topology.py / OS-Ken.
+    # This is exactly the workflow the guide recommends in section 10,
+    # step 1: "Person B writes unit tests for optimizer.py against a
+    # hand-built fake graph + fake migrate_fn immediately -- don't wait
+    # for topology.py or migrate_link.py." Mirrors coverage.py's own
+    # self-test graph so the two modules' self-checks agree.
+    # ------------------------------------------------------------------
+    import datetime
 
-    graph = build_graph(PROJECT_TOPO)
-    flows_path = os.path.join(
-        os.path.dirname(__file__), "..", "network", "flows_config.json"
-    )
-    flows = load_flows(flows_path)
+    import networkx as nx
+
+    def _fake_graph():
+        G = nx.Graph()
+        dpids = [f"{i:016x}" for i in range(7)]  # s0..s6
+        for d in dpids:
+            G.add_node(d, state="Legacy")
+        s0, s1, s2, s3, s4, s5, s6 = dpids
+        G.add_edge(s1, s0)
+        G.add_edge(s2, s0)
+        G.add_edge(s1, s2)  # redundant agg-to-agg cross-link
+        G.add_edge(s3, s1)
+        G.add_edge(s4, s1)
+        G.add_edge(s5, s2)
+        G.add_edge(s6, s2)
+        return G, dict(s0=s0, s1=s1, s2=s2, s3=s3, s4=s4, s5=s5, s6=s6)
+
+    def _fake_flows(name):
+        return [
+            {"name": "ctrl_s3", "destination_dpid": name["s3"],
+             "criticality": 0.9, "security_sla": 0.8, "latency_sla": 0.5},
+            {"name": "ctrl_s4", "destination_dpid": name["s4"],
+             "criticality": 0.9, "security_sla": 0.8, "latency_sla": 0.5},
+            {"name": "ctrl_s5", "destination_dpid": name["s5"],
+             "criticality": 0.3, "security_sla": 0.5, "latency_sla": 0.7},
+            {"name": "ctrl_s6", "destination_dpid": name["s6"],
+             "criticality": 0.5, "security_sla": 0.6, "latency_sla": 0.5},
+        ]
+
+    def _fake_migrate_always_success(dpid):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return {
+            "dpid": dpid,
+            "outcome": "success",
+            "baseline": {"latency_ms": 20.0, "failure_rate": 0.0, "overhead_bytes": 0},
+            "post": {"latency_ms": 24.5, "failure_rate": 0.0, "overhead_bytes": 512},
+            "timestamp": now,
+        }
+
+    def _fake_migrate_fails_once(fail_dpid):
+        """Fails the first time `fail_dpid` is migrated, succeeds after."""
+        seen = {"count": 0}
+
+        def _fn(dpid):
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            if dpid == fail_dpid and seen["count"] == 0:
+                seen["count"] += 1
+                return {
+                    "dpid": dpid, "outcome": "failed",
+                    "baseline": {"latency_ms": 20.0, "failure_rate": 0.0, "overhead_bytes": 0},
+                    "post": None, "timestamp": now,
+                }
+            return _fake_migrate_always_success(dpid)
+
+        return _fn
+
+    # --- Test 1: unlimited budget -> full migration, full coverage ---
+    G, name = _fake_graph()
+    flows = _fake_flows(name)
+    total_weight = sum(flow_weight(f) for f in flows)
+
+    print("Starting coverage:", compute_coverage(G, flows))
+    assert compute_coverage(G, flows) == 0.0
+
+    d_plus = supermodular_degree(G, flows)
+    ratio = sgbm_approx_ratio(G, flows)
+    print(f"Measured supermodular degree d = {d_plus}")
+    print(f"SGBM structural approximation ratio: 1 - e^(-1/({d_plus}+1)) = {ratio:.3f}")
+
     tracker = CapabilityTracker()
-
-    print("Starting coverage:", total_coverage(graph, flows))
-    assert total_coverage(graph, flows) == 0
-
-    history = run_greedy_migration(graph, flows, tracker)
-
-    final_score = total_coverage(graph, flows)
-    print("\nFinal coverage:", final_score)
-    # matches visualize.py Stage 2 (all links migrated -> total = 9)
-    assert final_score == 9
-
-    all_hybrid = all(
-        data["state"] == "Hybrid" for _, _, data in graph.edges(data=True)
+    schedule, final_coverage = run_sgbm(
+        G, flows, budget=100.0, migrate_fn=_fake_migrate_always_success,
+        capability=tracker,
     )
-    assert all_hybrid
 
-    print("\nMigration order (%d links):" % len(history))
-    for (a, b), gain in history:
-        print(f"  {a}-{b}  gain=+{gain}")
+    print("\nFinal coverage:", final_coverage)
+    assert abs(final_coverage - total_weight) < 1e-9
+    assert all(G.nodes[n]["state"] == "Hybrid" for n in G.nodes)
+    assert all(r["outcome"] == "success" for r in schedule)
+    print(f"Migrated {len(schedule)} switch(es) across the run.")
 
-    print("\nCapability tracker summary:")
+    # --- Test 2: tight budget -> exercises the fallback progress path ---
+    # Default cost is COST_FLOOR = 0.259 per switch. The cheapest flow
+    # batch here is 2 switches (0.518), so a budget of 0.3 can't afford
+    # any batch but can afford exactly one single switch.
+    G2, name2 = _fake_graph()
+    flows2 = _fake_flows(name2)
+    tracker2 = CapabilityTracker()
+    schedule2, cov_after_2 = run_sgbm(
+        G2, flows2, budget=0.3, migrate_fn=_fake_migrate_always_success,
+        capability=tracker2, verbose=False,
+    )
+    assert len(schedule2) == 1
+    assert 0.0 <= cov_after_2 <= total_weight
+
+    # --- Test 3: a failed migration should not flip state, and should
+    #     raise that switch's cost so the tracker actually reacts ---
+    G3, name3 = _fake_graph()
+    flows3 = _fake_flows(name3)
+    tracker3 = CapabilityTracker()
+    flaky_switch = name3["s3"]  # ctrl_s3's own edge switch
+    schedule3, _ = run_sgbm(
+        G3, flows3, budget=100.0,
+        migrate_fn=_fake_migrate_fails_once(flaky_switch),
+        capability=tracker3, verbose=False,
+    )
+    failed_events = [r for r in schedule3 if r["dpid"] == flaky_switch and r["outcome"] == "failed"]
+    success_events = [r for r in schedule3 if r["dpid"] == flaky_switch and r["outcome"] == "success"]
+    assert len(failed_events) == 1
+    assert len(success_events) == 1  # it succeeds on the retry within the same run
+    assert G3.nodes[flaky_switch]["state"] == "Hybrid"  # eventually migrated
+    # 1 success, 1 failed -> failure_rate 0.5 baked into future cost,
+    # even though this run already finished migrating it successfully
+    assert abs(tracker3.cost(flaky_switch) - COST_FLOOR * (1.0 + 2.0 * 0.5)) < 1e-9
+
+    # --- Test 4: gain counts every flow a batch completes (Sec. 4) ---
+    # Chain core c <- m <- e (+ leaf x so c has the top degree).
+    # Flow A: m -> c.  Flow B: e -> m -> c.  Migrating B's batch
+    # {e, m, c} also completes A, so B's true gain is w(A) + w(B),
+    # not just w(B) (the old per-flow value).
+    G5 = nx.Graph()
+    c, m, e = f"{0:016x}", f"{1:016x}", f"{2:016x}"
+    x = f"{3:016x}"
+    for d in (c, m, e, x):
+        G5.add_node(d, state="Legacy")
+    G5.add_edge(m, c)
+    G5.add_edge(e, m)
+    G5.add_edge(x, c)       # extra leaf so the core c has the top degree
+    assert core_switch(G5) == c
+    fa = {"name": "A", "destination_dpid": m,
+          "criticality": 0.5, "security_sla": 0.5, "latency_sla": 0.5}
+    fb = {"name": "B", "destination_dpid": e,
+          "criticality": 0.5, "security_sla": 0.5, "latency_sla": 0.5}
+    wa, wb = flow_weight(fa), flow_weight(fb)
+    t5 = CapabilityTracker()
+    pick = pick_best_batch(G5, [fa, fb], budget=100.0, capability=t5)
+    best_f, best_Lf, best_cost, best_gain = pick
+    # B's batch {e, m, c} also completes A -> gain = wa + wb, score
+    # = (wa+wb)/(3*floor) beats A's batch {m, c}: wa/(2*floor).
+    assert best_f["name"] == "B", best_f["name"]
+    assert abs(best_gain - (wa + wb)) < 1e-9, best_gain
+
+    print("\nCapability tracker (Test 1) summary:")
     print(tracker.summary())
 
-    print("\nAll self-checks passed.")
+    print("\nAll optimizer.py self-checks passed (no topology.py or OS-Ken required).")
+

@@ -1,129 +1,190 @@
 """
 topology.py
-Feature 1 (part 1): Network and Flow Model
+Feature 1 -- Control-Plane Topology Adapter (Person A)
 
-Builds a networkx graph representing the SDN testbed topology and
-exposes a single clean function, build_graph(), for other modules
-to import.
+CORRECTED MODEL (see QSMO_Implementation_Guide.docx, section 2 and 6.1)
+------------------------------------------------------------------------
+This is the LINK graph: switch <-> switch control-plane adjacency,
+discovered live from OS-Ken's own topology events (LLDP-based), for
+the switches that Mininet/OVS brings up via topo.py. It is NOT built
+from topo.py, NOT built from a hand-written dict, and does not import
+anything from topo.py. The orchestrator side and the Mininet side only
+agree on the dpid naming convention (16-hex-char dpid strings), per
+the guide's section 4 and 5.1.
+
+NO-HARDCODE RULE (guide section 6.1)
+-------------------------------------
+There are zero switch names, dpids, or switch counts written literally
+anywhere below. Every node and edge comes from topo_api.get_all_switch()
+/ get_all_link() at the moment the graph is rebuilt. If the physical
+topology changes (topo.py is swapped for a different shape, a switch
+is added/removed, a link flaps), this module reacts to the resulting
+OS-Ken event and rebuilds G from scratch -- nothing here needs to be
+edited by hand. This is what makes topology.py "not static."
+
+Controller (c0) is deliberately NOT a node in this graph. LLDP-based
+topology discovery only sees switch<->switch links; the controller's
+own control channel isn't part of that discovery. This matches the
+guide's corrected model: Pf for a flow is measured over the discovered
+switch graph only (section 2.2).
+
+Note on STP interaction (learned during live verification): the
+discovered graph reflects the ACTIVE spanning tree, not the full
+physical wiring -- a port that STP has put into blocking state does
+not forward LLDP probes either, so a redundant/backup link (e.g. the
+s1-s2-s0 triangle's blocked leg) will not appear as an edge here while
+it is blocked. This is correct behavior for this module (it only
+reports what LLDP can currently see), but means core_dpid and every
+Pf(flow) are computed over whichever spanning tree STP has currently
+converged to, which can differ between runs. Verified live against two
+different converged topologies (7 switches/7 links, and 7 switches/6
+links with a different elected core switch) -- compute_path()/
+compute_coverage() in coverage.py produced correct results in both
+cases with zero code changes, confirming the topology-agnostic
+property this module is designed for.
+
+Data contract this module implements (guide section 5.1):
+    get_graph()          -> networkx.Graph
+        node id       : dpid, 16-hex-char string, e.g. "0000000000000003"
+        node['name']  : human label if known (best-effort, may be None)
+        node['state'] : "Legacy" | "Hybrid"  (default "Legacy" for a new switch)
+        edge          : undirected, one per discovered switch<->switch LLDP link
+    get_state(dpid)   -> "Legacy" | "Hybrid"
+    set_state(dpid, value) -> None
+
+State ownership rule (guide section 2.3): this module never decides
+WHEN a switch becomes Hybrid or reverts to Legacy -- that is
+migrate_link.py (Person C) and monitor.py (Person D)'s job
+respectively. topology.py only stores whatever state it is told and
+answers questions about the graph. coverage.py (also Person A) only
+reads this graph; it never calls set_state.
 """
 
-import json
+from os_ken.base import app_manager
+from os_ken.controller.handler import set_ev_cls
+from os_ken.topology import event, api as topo_api
+
 import networkx as nx
 
 
-def build_graph(topo_description):
+class TopologyAdapter(app_manager.OSKenApp):
     """
-    Build a networkx Graph from a simple topology description.
+    OS-Ken app that maintains the single authoritative NetworkX graph
+    of the SDN control plane's switch-to-switch adjacency, and the
+    per-dpid Legacy/Hybrid state.
 
-    topo_description is a dict of the form:
-        {
-            "switches": ["s1", "s2", "s3", ...],
-            "hosts":    ["h1", "h2", "h3", ...],
-            "links": [
-                {"a": "s1", "b": "s2"},
-                {"a": "s1", "b": "h1"},
-                ...
-            ]
-        }
+    Run this alongside the rest of the orchestrator apps under
+    osken-manager. The SSL flags are required for the switch<->
+    controller handshake to succeed at all -- topo.py only configures
+    the switch side of that handshake; OS-Ken's own SSL listener needs
+    these to present its own certificate:
 
-    In a real deployment this description would come from querying
-    the running Mininet topology (see load_topology_from_mininet
-    below); for development/testing it can be loaded from a small
-    JSON/dict fixture instead, since the graph logic itself doesn't
-    care where the description came from.
+        sudo osken-manager --observe-links \\
+            --ctl-privkey migration/certs/controller.key \\
+            --ctl-cert migration/certs/controller.cert \\
+            --ca-certs migration/certs/ca.cert \\
+            network/topology.py \\
+            controller/simple_l2_switch.py
 
-    Returns:
-        networkx.Graph -- nodes are switches/hosts, edges are links.
-        Every edge starts in the "Legacy" security state.
+    --observe-links is required -- without it, OS-Ken never emits
+    EventLinkAdd / EventLinkDelete and this graph will only ever have
+    isolated nodes.
     """
-    graph = nx.Graph()
 
-    for switch in topo_description.get("switches", []):
-        graph.add_node(switch, node_type="switch")
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.G = nx.Graph()
+        # dpid (str) -> "Legacy" | "Hybrid". Kept separate from G so a
+        # state survives a _rebuild() even for a switch that
+        # momentarily drops out of the discovered graph (e.g. a link
+        # flap that doesn't actually take the switch itself down).
+        self.states = {}
+        # dpid (str) -> human label, best-effort only, never relied on
+        # for any graph logic (see docstring above).
+        self.names = {}
 
-    for host in topo_description.get("hosts", []):
-        graph.add_node(host, node_type="host")
+    # ---- OS-Ken event hooks -------------------------------------------------
+    # Every one of these just triggers a full rebuild from OS-Ken's own
+    # live topology API. Nothing here special-cases a particular
+    # switch, dpid, or count.
 
-    for link in topo_description.get("links", []):
-        a, b = link["a"], link["b"]
-        if a not in graph or b not in graph:
-            raise ValueError(f"Link references unknown node: {a} - {b}")
-        # every link starts as Legacy (classical TLS only) until
-        # Feature 4 migrates it to Hybrid
-        graph.add_edge(a, b, state="Legacy")
+    @set_ev_cls(event.EventSwitchEnter)
+    def on_switch_enter(self, ev):
+        self._rebuild()
 
-    return graph
+    @set_ev_cls(event.EventSwitchLeave)
+    def on_switch_leave(self, ev):
+        self._rebuild()
 
+    @set_ev_cls(event.EventLinkAdd)
+    def on_link_add(self, ev):
+        self._rebuild()
 
-def load_topology_description(path):
-    """Load a topology description from a JSON file on disk."""
-    with open(path, "r") as f:
-        return json.load(f)
+    @set_ev_cls(event.EventLinkDelete)
+    def on_link_delete(self, ev):
+        self._rebuild()
 
+    # ---- Core rebuild logic ---------------------------------------------
 
-def load_topology_from_mininet(net):
-    """
-    OPTIONAL bridge for once you're running this against your real
-    Mininet topology instead of the JSON fixture.
+    def _rebuild(self):
+        """
+        Throw the old graph away and reconstruct it entirely from what
+        OS-Ken currently reports. This is intentionally simple (no
+        incremental diffing) so there is no way for stale state to
+        linger after a topology change -- correctness over micro-
+        efficiency, since this only runs on switch/link churn, not on
+        a hot path.
+        """
+        switches = topo_api.get_all_switch(self)
+        links = topo_api.get_all_link(self)
 
-    Call this from a script that mininet itself imports, e.g.:
+        G = nx.Graph()
+        for sw in switches:
+            dpid = self._dpid_str(sw.dp.id)
+            G.add_node(
+                dpid,
+                name=self.names.get(dpid),
+                state=self.states.get(dpid, "Legacy"),
+            )
+        for lk in links:
+            src = self._dpid_str(lk.src.dpid)
+            dst = self._dpid_str(lk.dst.dpid)
+            if src in G and dst in G:
+                G.add_edge(src, dst)
 
-        from mininet.net import Mininet
-        from topology import load_topology_from_mininet, build_graph
+        self.G = G
 
-        net = Mininet(topo=my_topo)
-        net.start()
-        topo_description = load_topology_from_mininet(net)
-        graph = build_graph(topo_description)
+    @staticmethod
+    def _dpid_str(dpid_int):
+        """Canonical 16-hex-char dpid string, per the guide's 5.1 contract."""
+        return "%016x" % dpid_int
 
-    net is a running mininet.net.Mininet instance. This walks net.switches
-    and net.hosts and net.links to produce the same dict shape build_graph()
-    already expects, so nothing else in Feature 1/2 has to change.
-    """
-    switches = [s.name for s in net.switches]
-    hosts = [h.name for h in net.hosts]
-    links = []
-    for link in net.links:
-        a = link.intf1.node.name
-        b = link.intf2.node.name
-        links.append({"a": a, "b": b})
-    return {"switches": switches, "hosts": hosts, "links": links}
+    # ---- Public contract (guide section 5.1) -----------------------------
 
+    def get_graph(self):
+        """Return the current live switch<->switch control-plane graph."""
+        return self.G
 
-def summarize(graph):
-    """Small human-readable summary, useful for a self-test / demo."""
-    print(f"Nodes: {graph.number_of_nodes()}  Edges: {graph.number_of_edges()}")
-    for node, data in graph.nodes(data=True):
-        print(f"  {node:>4}  ({data['node_type']})")
-    for a, b, data in graph.edges(data=True):
-        print(f"  {a} -- {b}   state={data['state']}")
+    def get_state(self, dpid):
+        """"Legacy" | "Hybrid" for a given dpid; unseen switches default to Legacy."""
+        return self.states.get(dpid, "Legacy")
 
+    def set_state(self, dpid, value):
+        """
+        Record a state transition for dpid. Per the ownership rule
+        (guide 2.3), topology.py itself never calls this on its own
+        initiative -- migrate_link.py calls it after a verified
+        successful Hybrid cutover, monitor.py calls it after a
+        rollback. This method only enforces the invariant and keeps
+        the graph node's 'state' attribute in sync.
+        """
+        assert value in ("Legacy", "Hybrid"), f"invalid state: {value!r}"
+        self.states[dpid] = value
+        if dpid in self.G:
+            self.G.nodes[dpid]["state"] = value
 
-# This mirrors topo.py exactly: 7 switches (s0 core, s1/s2 agg, s3-s6
-# edge), 8 hosts in 4 groups, plus the s1-s2 cross-link that creates
-# the triangle s0-s1-s2-s0. Kept here so topology.py/coverage.py can be
-# demoed and unit-tested without needing Mininet running.
-PROJECT_TOPO = {
-    "switches": ["s0", "s1", "s2", "s3", "s4", "s5", "s6"],
-    "hosts": ["h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8"],
-    "links": [
-        # hosts -> edge switches
-        {"a": "h1", "b": "s3"}, {"a": "h2", "b": "s3"},   # hospital
-        {"a": "h3", "b": "s4"}, {"a": "h4", "b": "s4"},   # banking
-        {"a": "h5", "b": "s5"}, {"a": "h6", "b": "s5"},   # video
-        {"a": "h7", "b": "s6"}, {"a": "h8", "b": "s6"},   # iot
-        # edge -> aggregation
-        {"a": "s3", "b": "s1"}, {"a": "s4", "b": "s1"},   # agg-A
-        {"a": "s5", "b": "s2"}, {"a": "s6", "b": "s2"},   # agg-B
-        # aggregation -> core
-        {"a": "s1", "b": "s0"}, {"a": "s2", "b": "s0"},
-        # redundant agg-to-agg cross-link (creates the triangle)
-        {"a": "s1", "b": "s2"},
-    ],
-}
-
-if __name__ == "__main__":
-    # self-test: build the actual project topology (matching topo.py)
-    # and print it
-    g = build_graph(PROJECT_TOPO)
-    summarize(g)
+    def set_name(self, dpid, name):
+        """Optional best-effort human label; never used for graph logic."""
+        self.names[dpid] = name
+        if dpid in self.G:
+            self.G.nodes[dpid]["name"] = name

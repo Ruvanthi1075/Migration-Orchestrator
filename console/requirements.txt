@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+networkx>=3.0
+reportlab>=4.0
+httpx>=0.27   # only for the test client

@@ -12,7 +12,7 @@ Everything else adapts on its own:
 
 HOW TO CHANGE THE TOPOLOGY
 --------------------------
-Option 1 - edit the line  TOPOLOGY = multisite(3, 5)   # 15 switches: 3 sites x (1 gateway + 4 edge ring)  below, e.g.
+Option 1 - edit the line  TOPOLOGY = grid(3, 3)   # 9 switches, 12 links, 9 hosts  below, e.g.
         TOPOLOGY = ring(6)            TOPOLOGY = tree(depth=3, fanout=2)
         TOPOLOGY = line(5)            TOPOLOGY = star(8)      TOPOLOGY = mesh(4)
 Option 2 - no edit:   sudo python3 network/topo.py --topology ring:6
@@ -53,7 +53,7 @@ SYNC_SCRIPT = os.path.join(_HERE, '..', 'sync_topology.sh')
 CONTROLLER_IP = '127.0.0.1'
 CONTROLLER_PORT = 6653
 
-STP_WAIT_S = int(os.environ.get('QSMO_STP_WAIT', '0'))  # 0 = auto (scales with switch count)
+STP_WAIT_S = int(os.environ.get('QSMO_STP_WAIT', '45'))
 
 
 # ======================================================================
@@ -137,30 +137,6 @@ def grid(rows, cols, hosts_per_switch=1):
     return {'switches': sw, 'hosts': _attach_hosts(names, hosts_per_switch), 'links': links}
 
 
-def multisite(sites, per_site, hosts_per_edge=1):
-    """`sites` campuses of `per_site` switches each (1 gateway + ring of edge switches).
-
-    Inside a site: edge switches form a ring and the gateway attaches to two
-    opposite edge switches. Between sites: the gateways are fully meshed.
-    multisite(3, 5) -> 15 switches: gateways s0/s5/s10, edge s1-s4, s6-s9, s11-s14.
-    """
-    if per_site < 4:
-        raise SystemExit("multisite needs per_site >= 4")
-    names, sw = _named(sites * per_site)
-    links, gateways, edges = [], [], []
-    for k in range(sites):
-        base = k * per_site
-        gw = names[base]
-        ring_nodes = names[base + 1: base + per_site]
-        gateways.append(gw)
-        edges.extend(ring_nodes)
-        links += [(ring_nodes[i], ring_nodes[i + 1]) for i in range(len(ring_nodes) - 1)]
-        links.append((ring_nodes[-1], ring_nodes[0]))
-        links += [(gw, ring_nodes[0]), (gw, ring_nodes[len(ring_nodes) // 2])]
-    links += [(gateways[i], gateways[j]) for i in range(sites) for j in range(i + 1, sites)]
-    return {'switches': sw, 'hosts': _attach_hosts(edges, hosts_per_edge), 'links': links}
-
-
 def tree(depth, fanout, hosts_per_leaf=1):
     """Complete tree: depth levels below the root, `fanout` children each."""
     links, level, count = [], [0], 1
@@ -191,7 +167,7 @@ def from_name(spec):
 # ======================================================================
 #                      >>>  EDIT THIS LINE  <<<
 # ======================================================================
-TOPOLOGY = multisite(3, 5)   # 15 switches: 3 sites x (1 gateway + 4 edge ring)
+TOPOLOGY = grid(3, 3)   # 9 switches, 12 links, 9 hosts
 # ======================================================================
 
 
@@ -337,9 +313,8 @@ def build(spec=None):
     run_sync()
 
     if cyclic:
-        wait_s = STP_WAIT_S or max(45, 5 * len(names))
-        info('*** Waiting for STP to converge (%ds)...\n' % wait_s)
-        time.sleep(wait_s)
+        info('*** Waiting for STP to converge (%ds)...\n' % STP_WAIT_S)
+        time.sleep(STP_WAIT_S)
         info('*** Verify: sudo ovs-appctl stp/show <switch>  (ports forwarding, not blocking)\n')
     else:
         time.sleep(3)

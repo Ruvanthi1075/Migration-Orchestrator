@@ -1,15 +1,47 @@
-# secrets -- never commit these
-*.pem
-*.key
+# --- Certificates / keys (never commit) ---
 migration/certs/
+migration/hybrid/certs/
+*.key
+*.pem
+*.cert
+*.crt
+*.csr
+*.srl
+*.p12
+*.pfx
+*.jks
 
-# python
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
-sdn-env/
+venv/
+.pytest_cache/
+*.egg-info/
 
-# results you regenerate, not hand-authored
-results/logs/*.csv
-results/logs/*.json
-results/plots/*.png
+# --- Logs ---
+*.log
+migration/hybrid/stunnel/logs/
+
+# --- Auto-generated per-switch / per-topology state ---
+migration/hybrid/stunnel/client_*.conf
+migration/hybrid/port_registry.json
+migration/hybrid/port_registry.json.lock
+
+# --- Backup / temp files ---
+*.bak
+*.backup
+*.current
+*.old
+*.orig
+*.tmp
+*~
+*.pre-bbm-cleanup
+*_backup.py
+*_backup/
+
+# --- Env / OS / editor ---
+.env
+.DS_Store
+.vscode/
+.idea/

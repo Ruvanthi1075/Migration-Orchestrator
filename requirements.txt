@@ -1,0 +1,13 @@
+networkx
+os-ken
+numpy
+pandas
+cryptography
+pyOpenSSL
+requests
+PyYAML
+scipy
+# --- console API (optional) ---
+fastapi
+uvicorn
+reportlab
