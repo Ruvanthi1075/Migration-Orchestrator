@@ -20,12 +20,14 @@ QSMO Migration-Orchestrator is a research and demonstration system for coordinat
 - [Demonstration environment](#demonstration-environment)
 - [Repository layout](#repository-layout)
 - [Prerequisites](#prerequisites)
-- [Setup](#setup)
-- [Run the integrated demonstration](#run-the-integrated-demonstration)
+- [Initial setup](#initial-setup)
+- [Running the demonstration](#running-the-demonstration)
+- [Changing the topology](#changing-the-topology)
 - [Validate network connectivity](#validate-network-connectivity)
 - [Run tests](#run-tests)
 - [Demonstrated results](#demonstrated-results)
 - [Monitoring scenario](#monitoring-scenario)
+- [QSMO Console API](#qsmo-console-api)
 - [Logs and troubleshooting](#logs-and-troubleshooting)
 - [Limitations](#limitations)
 - [Future work](#future-work)
@@ -52,6 +54,8 @@ QSMO Migration-Orchestrator is a research and demonstration system for coordinat
 - **Automatic rollback:** Reverts a migrated switch when the configured demonstration health conditions are violated.
 - **Outcome tracking:** Records migration and rollback outcomes in the migration ledger.
 - **Network validation:** Uses Mininet host reachability tests to check connectivity after recovery.
+- **Any-topology support:** Topology is defined in a single file (`network/topo.py`); coverage model, optimizer, monitor, certificates, ports and flows adapt automatically.
+- **Management console API:** FastAPI backend for a management dashboard.
 
 ## Architecture and workflow
 
@@ -81,29 +85,10 @@ The integrated demonstration was run in an Ubuntu virtual machine with:
 - Mininet
 - Open vSwitch (OVS)
 - OS-Ken
+- stunnel and OpenSSL
 - Git
 
-The default demonstration topology contains seven switches and eight hosts. The launcher may use elevated privileges for network emulation and controller operations.
-
-## Run on any topology (edit only `network/topo.py`)
-
-`network/topo.py` is the single place the topology is defined. Everything else (coverage model, SGBM optimizer, monitor, Hybrid migration, certificates, port assignments, flow definitions, live tests, console API) adapts automatically.
-
-```bash
-# pick a built-in shape without editing anything ...
-sudo python3 network/topo.py --topology ring:6      # default | line:N | ring:N | star:N | mesh:N | tree:DEPTH:FANOUT
-# ... or edit the TOPOLOGY = ... line in network/topo.py (or write your own switches/hosts/links dict)
-```
-
-After the switches are up, `topo.py` runs `./sync_topology.sh`, which regenerates `network/flows_config.json`, the port registry + `docs/PORTS.md`, and the per-switch Hybrid certificates (incremental: only missing certs are issued). Then start the controller / demo as usual (`./run_qsmo_demo.sh`). Set `QSMO_AUTO_SYNC=0` to skip the sync and run it by hand.
-
-Rules enforced before Mininet starts: unique non-zero 16-hex dpids, connected switch graph, hosts attached to existing switches. STP is enabled only when the topology contains a loop.
-
-Offline verification (no Mininet needed): `python3 tests/test_any_topology.py` runs the real coverage model and SGBM optimizer over 17 topology shapes; `python3 -m optimizer.run_experiment --topology ring:6` runs the budget sweep on one.
-
-## QSMO Console API
-
-`console/` is a FastAPI backend (no authentication) for a management dashboard: `pip install -r console/requirements.txt && uvicorn console.main:app --port 8000`, then open `/docs`. See `console/ENDPOINTS.md`.
+The default demonstration topology contains seven switches and eight hosts. Network emulation and controller operations require elevated privileges (`sudo`).
 
 ## Repository layout
 
@@ -120,8 +105,6 @@ Migration-Orchestrator/
 └── run_qsmo_demo.sh     # Integrated demonstration launcher
 ```
 
-Other project files may be present. The descriptions above identify the principal areas used by the documented workflow.
-
 ## Prerequisites
 
 Install or configure the following in a supported Ubuntu environment:
@@ -130,50 +113,94 @@ Install or configure the following in a supported Ubuntu environment:
 - Mininet
 - Open vSwitch
 - OS-Ken and the Python dependencies required by this repository
+- stunnel and OpenSSL
 
-Mininet and Open vSwitch require system-level configuration and appropriate privileges. Use the installation instructions appropriate to your Ubuntu release and lab environment.
+Mininet and Open vSwitch require system-level configuration and appropriate privileges.
 
-## Setup
+## Initial setup
 
-### 1. Clone the repository
+Clone the repository and prepare the Python environment:
 
 ```bash
 git clone https://github.com/Ruvanthi1075/Migration-Orchestrator.git
 cd Migration-Orchestrator
-```
-
-### 2. Check out the demonstration branch
-
-```bash
 git checkout monitor
-```
-
-### 3. Create a Python virtual environment
-
-```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-If a `requirements.txt` is present in the checked-out version, install its dependencies:
-
-```bash
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt   # if present
 ```
 
-If no dependency file is provided, install the project's required Python packages using the versions configured for your lab environment. Ensure OS-Ken, Mininet, and OVS are available before running the integrated scenario.
+Then run the following three steps **once**, in order.
 
-## Run the integrated demonstration
+### Step 1 — Fix stunnel paths
 
-From the repository root:
+Points the stunnel config at your local clone instead of the original author's path.
 
 ```bash
-chmod +x run_qsmo_demo.sh
-./run_qsmo_demo.sh
+cd ~/Desktop/ndc_project/Migration-Orchestrator
+sed -i 's#/home/ruvan/Migration-Orchestrator#'"$PWD"'#g' migration/hybrid/stunnel/server.conf
+grep -n "/home/" migration/hybrid/stunnel/server.conf   # verify: should only show your path
+mkdir -p migration/hybrid/stunnel/logs
 ```
 
-The launcher starts the integrated demonstration and may request a password for privileged networking operations. Review the terminal output and wait for the final status.
+### Step 2 — Start the topology
+
+```bash
+cd ~/Desktop/ndc_project/Migration-Orchestrator
+sudo QSMO_AUTO_SYNC=0 python3 network/topo.py
+```
+
+### Step 3 — Sync topology (flows, ports, Hybrid certificates)
+
+Run this from a second terminal while the topology is up.
+
+```bash
+cd ~/Desktop/ndc_project/Migration-Orchestrator
+sudo chown -R $USER:$USER migration docs network reports 2>/dev/null
+bash sync_topology.sh
+ls migration/hybrid/certs/
+```
+
+## Running the demonstration
+
+After the initial setup, run these four steps in order.
+
+### Step 1 — Clean up previous runs
+
+```bash
+cd ~/Desktop/ndc_project/Migration-Orchestrator
+sudo pkill -9 -f osken-manager; sudo pkill -9 stunnel
+sudo mn -c
+sudo ovs-vsctl list Controller | grep -E "target|is_connected"
+```
+
+### Step 2 — Start the controller and live orchestrated test
+
+```bash
+cd ~/Desktop/ndc_project/Migration-Orchestrator
+source .venv/bin/activate
+LOG=~/qsmo_demo_$(date +%Y%m%d_%H%M%S).log
+sudo -E env "PATH=$PATH" PYTHONPATH="$PWD" "$(which osken-manager)" --observe-links \
+  --ctl-privkey migration/certs/controller.key \
+  --ctl-cert migration/certs/controller.cert \
+  --ca-certs migration/certs/ca.cert \
+  network/topology.py controller/simple_l2_switch.py \
+  controller/qsmo_echo_probe.py tests/test_sgbm_live_orchestrated.py 2>&1 | tee "$LOG"
+```
+
+### Step 3 — Start the topology (second terminal)
+
+```bash
+cd ~/Desktop/ndc_project/Migration-Orchestrator
+sudo QSMO_AUTO_SYNC=0 python3 network/topo.py
+```
+
+### Step 4 — Verify controller connections
+
+```bash
+sudo ovs-vsctl list Controller | grep -E "target|is_connected"
+```
 
 A successful integrated run includes the marker:
 
@@ -182,6 +209,34 @@ INTEGRATED LIVE SGBM + MONITOR + AUTOMATIC ROLLBACK PASSED
 ```
 
 The exact log details and results can vary by environment.
+
+## Changing the topology
+
+`network/topo.py` is the single place the topology is defined. Everything else adapts automatically.
+
+Pick a built-in shape or edit the `TOPOLOGY = ...` line in `network/topo.py`:
+
+```bash
+sudo python3 network/topo.py --topology ring:6   # default | line:N | ring:N | star:N | mesh:N | tree:DEPTH:FANOUT
+```
+
+To apply a new topology:
+
+1. Regenerate certificates:
+
+   ```bash
+   rm -rf migration/certs migration/hybrid/certs
+   ./migration/gen_certs.sh
+   openssl verify -CAfile migration/certs/ca.cert migration/certs/controller.cert migration/certs/switch.cert
+   ```
+
+2. Start again with the [Running the demonstration](#running-the-demonstration) steps.
+
+If the topology definition changed, also re-run `bash sync_topology.sh` (Initial setup, Step 3) so flows, ports and Hybrid certificates match.
+
+Rules enforced before Mininet starts: unique non-zero 16-hex dpids, connected switch graph, hosts attached to existing switches. STP is enabled only when the topology contains a loop.
+
+Offline verification (no Mininet needed): `python3 tests/test_any_topology.py` runs the real coverage model and SGBM optimizer over 17 topology shapes; `python3 -m optimizer.run_experiment --topology ring:6` runs the budget sweep on one.
 
 ## Validate network connectivity
 
@@ -203,13 +258,13 @@ The repository includes tests for monitoring, migration, rollback, and topology 
 
 Topology-independence check (offline): `python3 tests/test_any_topology.py`.
 
-A general test invocation is:
+General invocation:
 
 ```bash
 python3 -m pytest tests/
 ```
 
-Some integration tests may require Mininet, OVS, OS-Ken, elevated privileges, or a configured network environment. If a test fails because a system dependency is missing, install or configure that dependency before interpreting the result as a code failure.
+Some integration tests require Mininet, OVS, OS-Ken, elevated privileges, or a configured network environment. If a test fails because a system dependency is missing, install or configure that dependency before interpreting the result as a code failure.
 
 ## Demonstrated results
 
@@ -236,9 +291,20 @@ The integrated rollback demonstration deliberately injects synthetic values to e
 
 Because the inputs are intentionally outside the configured thresholds, the scenario exercises the automatic rollback behavior. **Do not describe these injected values as live production measurements.**
 
+## QSMO Console API
+
+`console/` is a FastAPI backend (no authentication) for a management dashboard:
+
+```bash
+pip install -r console/requirements.txt
+uvicorn console.main:app --port 8000
+```
+
+Then open `/docs`. See `console/ENDPOINTS.md`.
+
 ## Logs and troubleshooting
 
-The launcher creates a timestamped log in the user's home directory. Use the log to review controller startup, switch connections, migration events, health observations, rollback decisions, and final checks.
+The controller step creates a timestamped log (`~/qsmo_demo_<timestamp>.log`) in the user's home directory. Use it to review controller startup, switch connections, migration events, health observations, rollback decisions, and final checks.
 
 Useful checks:
 
@@ -247,9 +313,15 @@ git status
 python3 --version
 which mn
 which ovs-vsctl
+sudo ovs-vsctl list Controller | grep -E "target|is_connected"
 ```
 
-If the demo cannot start, check that Mininet and OVS are installed and available, that the launcher is being run from the repository root, and that required privileges are available. Avoid deleting project files or changing controller configuration until the relevant error in the log has been identified.
+If the demo cannot start:
+
+- Run the cleanup step (Running the demonstration, Step 1) to kill stale `osken-manager`/`stunnel` processes and reset Mininet.
+- Confirm Mininet and OVS are installed and commands are run from the repository root.
+- Confirm certificates exist in `migration/certs/` and `migration/hybrid/certs/`.
+- Identify the relevant error in the log before changing files or controller configuration.
 
 ## Limitations
 
