@@ -1,2 +1,0 @@
-Delete controller/qsmo_monitor_app.py (the monitor is now its own program: run_monitor.sh).
-Then: chmod +x *.sh
