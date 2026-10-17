@@ -45,3 +45,6 @@ migration/hybrid/port_registry.json.lock
 .DS_Store
 .vscode/
 .idea/
+
+# --- QSMO runtime state (snapshot, ledger, baselines) ---
+runtime/

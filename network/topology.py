@@ -62,9 +62,15 @@ reads this graph; it never calls set_state.
 
 from os_ken.base import app_manager
 from os_ken.controller.handler import set_ev_cls
+from os_ken.lib import hub
 from os_ken.topology import event, api as topo_api
 
 import networkx as nx
+
+try:  # persistent store shared with the migration CLI / monitor (migration/store.py)
+    from migration.store import Store as _Store
+except Exception:  # pragma: no cover - store optional; falls back to in-memory states
+    _Store = None
 
 
 class TopologyAdapter(app_manager.OSKenApp):
@@ -94,6 +100,14 @@ class TopologyAdapter(app_manager.OSKenApp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.G = nx.Graph()
+        # Persistent store: Legacy/Hybrid state survives controller restarts and is shared with
+        # the migration CLI (a separate process). None -> plain in-memory behaviour.
+        self.store = None
+        if _Store is not None:
+            try:
+                self.store = _Store()
+            except Exception as exc:  # never stop the controller over bookkeeping
+                self.logger.warning("QSMO store unavailable, states are in-memory only: %s", exc)
         # dpid (str) -> "Legacy" | "Hybrid". Kept separate from G so a
         # state survives a _rebuild() even for a switch that
         # momentarily drops out of the discovered graph (e.g. a link
@@ -102,6 +116,16 @@ class TopologyAdapter(app_manager.OSKenApp):
         # dpid (str) -> human label, best-effort only, never relied on
         # for any graph logic (see docstring above).
         self.names = {}
+        # Start from an empty published graph (never leave the previous run's snapshot around for
+        # the monitor / migration program to mistake for live data), then keep republishing every
+        # few seconds: the snapshot's age is the monitor's "controller is alive" signal.
+        self._publish_snapshot()
+        hub.spawn(self._heartbeat_loop)
+
+    def _heartbeat_loop(self):
+        while True:
+            hub.sleep(5)
+            self._publish_snapshot()
 
     # ---- OS-Ken event hooks -------------------------------------------------
     # Every one of these just triggers a full rebuild from OS-Ken's own
@@ -144,7 +168,7 @@ class TopologyAdapter(app_manager.OSKenApp):
             G.add_node(
                 dpid,
                 name=self.names.get(dpid),
-                state=self.states.get(dpid, "Legacy"),
+                state=self.get_state(dpid),
             )
         for lk in links:
             src = self._dpid_str(lk.src.dpid)
@@ -153,6 +177,16 @@ class TopologyAdapter(app_manager.OSKenApp):
                 G.add_edge(src, dst)
 
         self.G = G
+        self._publish_snapshot()
+
+    def _publish_snapshot(self):
+        """Export the live graph so other processes (migration CLI) can read it."""
+        if self.store is None:
+            return
+        try:
+            self.store.write_topology(self.G, self.names)
+        except Exception as exc:
+            self.logger.warning("could not write topology snapshot: %s", exc)
 
     @staticmethod
     def _dpid_str(dpid_int):
@@ -167,6 +201,11 @@ class TopologyAdapter(app_manager.OSKenApp):
 
     def get_state(self, dpid):
         """"Legacy" | "Hybrid" for a given dpid; unseen switches default to Legacy."""
+        if self.store is not None:
+            try:
+                return self.store.get_state(dpid)
+            except Exception:
+                pass
         return self.states.get(dpid, "Legacy")
 
     def set_state(self, dpid, value):
@@ -180,6 +219,11 @@ class TopologyAdapter(app_manager.OSKenApp):
         """
         assert value in ("Legacy", "Hybrid"), f"invalid state: {value!r}"
         self.states[dpid] = value
+        if self.store is not None:
+            try:
+                self.store.set_state(dpid, value, name=self.names.get(dpid))
+            except Exception as exc:
+                self.logger.warning("could not persist state %s=%s: %s", dpid, value, exc)
         if dpid in self.G:
             self.G.nodes[dpid]["state"] = value
 
@@ -188,3 +232,4 @@ class TopologyAdapter(app_manager.OSKenApp):
         self.names[dpid] = name
         if dpid in self.G:
             self.G.nodes[dpid]["name"] = name
+        self._publish_snapshot()

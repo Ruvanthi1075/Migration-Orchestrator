@@ -162,6 +162,7 @@ once, for exactly the dpid it is given.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import os
 import re
@@ -173,8 +174,10 @@ import time
 
 try:
     from migration.port_registry import default_registry as _port_registry
+    from migration.store import norm_dpid as _norm_dpid
 except ImportError:  # imported as top-level `migrate_link` (sys.path hack)
     from port_registry import default_registry as _port_registry
+    from store import norm_dpid as _norm_dpid
 
 # ---------------------------------------------------------------------
 # Config -- every path/port/timing here is a default, override via
@@ -260,6 +263,86 @@ class MigrationError(Exception):
     they are outcome="failed" results, per Algorithm 2's own design."""
 
 
+class _AdoptedProc:
+    """Minimal Popen-like handle for a stunnel started by an EARLIER process.
+    Only poll()/terminate()/kill()/wait() are needed by MigrationExecutor."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+            with open(f"/proc/{self.pid}/stat") as fh:   # zombie == dead
+                if fh.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return 0
+            return None
+        except (OSError, IndexError):
+            return 0
+
+    def terminate(self):
+        try:
+            os.kill(self.pid, 15)
+        except OSError:
+            pass
+
+    def kill(self):
+        try:
+            os.kill(self.pid, 9)
+        except OSError:
+            pass
+
+    def wait(self, timeout=None):
+        end = time.monotonic() + (timeout if timeout is not None else 1e9)
+        while self.poll() is None:
+            if time.monotonic() > end:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.05)
+        return 0
+
+
+def find_stunnel_pids(conf_path: str) -> list[int]:
+    """PIDs of running stunnel processes launched with exactly this config file."""
+    conf_path, out = os.path.abspath(conf_path), []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/cmdline", "rb") as fh:
+                argv = fh.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if argv and "stunnel" in os.path.basename(argv[0]):
+            if any(a and os.path.abspath(a) == conf_path for a in argv[1:]):
+                out.append(int(name))
+    return out
+
+
+def find_all_stunnel_pids(conf_dir: str) -> list[int]:
+    """Every stunnel whose config file lives in conf_dir (server + all clients)."""
+    conf_dir, out = os.path.abspath(conf_dir), []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/cmdline", "rb") as fh:
+                argv = fh.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if argv and "stunnel" in os.path.basename(argv[0]):
+            if any(a and os.path.dirname(os.path.abspath(a)) == conf_dir for a in argv[1:]):
+                out.append(int(name))
+    return out
+
+
 # ---------------------------------------------------------------------
 # Command execution -- wrapped behind a small object instead of calling
 # subprocess directly, so tests can inject a fake runner and exercise
@@ -287,7 +370,11 @@ class CommandRunner:
 
     def popen(self, args, stdout_path=None, env=None):
         stdout = open(stdout_path, "ab") if stdout_path else subprocess.DEVNULL
-        return subprocess.Popen(args, stdout=stdout, stderr=subprocess.STDOUT, env=env)
+        # start_new_session: stunnel gets its own session/process group, so Ctrl+C on (or the
+        # exit of) the process that launched it no longer kills the tunnels that Hybrid
+        # switches depend on. They keep running until a rollback / `reset` stops them.
+        return subprocess.Popen(args, stdout=stdout, stderr=subprocess.STDOUT, env=env,
+                                start_new_session=True)
 
 
 # ---------------------------------------------------------------------
@@ -362,9 +449,13 @@ class MigrationExecutor:
         verification_health_checks: int = VERIFICATION_HEALTH_CHECKS,
         data_plane_check_fn=None,
         verbose: bool = True,
+        store=None,
     ):
         self.topology = topology
         self.ledger = ledger
+        # Optional persistent store (migration/store.py). When given: per-switch locks
+        # serialise migrate/rollback/reconcile across processes, and events are audited.
+        self.store = store
         self.runner = runner or CommandRunner()
 
         self.controller_ip = controller_ip
@@ -434,6 +525,250 @@ class MigrationExecutor:
                 p.kill()
         self._client_procs.clear()
         self._server_proc = None
+
+    # -----------------------------------------------------------------
+    # Persistence across runs: stunnel keeps running, state is read back
+    # -----------------------------------------------------------------
+
+    def _audit(self, kind: str, message: str, dpid=None, source: str = "executor"):
+        self._log(message)
+        if self.store is not None:
+            try:
+                self.store.add_event(source, kind, message, dpid)
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def _switch_lock(self, dpid):
+        if self.store is None:
+            yield
+        else:
+            with self.store.switch_lock(dpid):
+                yield
+
+    @property
+    def server_conf_template(self) -> str:
+        return os.path.join(self.hybrid_conf_dir, "server.conf")
+
+    @property
+    def server_conf_path(self) -> str:
+        """The rendered file stunnel really reads (paths filled in for THIS checkout)."""
+        return os.path.join(self.hybrid_conf_dir, "server.rendered.conf")
+
+    def render_server_conf(self) -> str:
+        """server.conf is a template with @ROOT@ placeholders. Render it with the real
+        repository root so the server never reads certs/logs from another checkout."""
+        root = os.path.dirname(_THIS_DIR)
+        with open(self.server_conf_template) as fh:
+            text = fh.read().replace("@ROOT@", root)
+        os.makedirs(self.hybrid_conf_dir, exist_ok=True)
+        tmp = self.server_conf_path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, self.server_conf_path)
+        return self.server_conf_path
+
+    def _adopt(self, conf_path: str):
+        """Handle to an already-running stunnel using `conf_path`, else None."""
+        for pid in find_stunnel_pids(conf_path):
+            h = _AdoptedProc(pid)
+            if h.poll() is None:
+                self._log(f"adopted running stunnel pid={pid} ({os.path.basename(conf_path)})")
+                return h
+        return None
+
+    def adopt_running(self, dpids=()) -> dict:
+        """Re-attach to the shared server + per-switch clients left running by an earlier run."""
+        found = {"server": False, "clients": []}
+        srv = self._adopt(self.server_conf_path)
+        if srv is not None:
+            self._server_proc, found["server"] = srv, True
+        for d in dpids:
+            c = self._adopt(os.path.join(self.hybrid_conf_dir, f"client_{d}.conf"))
+            if c is not None:
+                self._client_procs[d] = c
+                found["clients"].append(d)
+        return found
+
+    def detach(self):
+        """Leave every stunnel running (own session) and just forget the handles."""
+        self._client_procs.clear()
+        self._server_proc = None
+
+    def stop_client(self, dpid: str):
+        """Stop ONE switch's stunnel client (used after a rollback to Legacy)."""
+        self.adopt_running([dpid])
+        proc = self._client_procs.pop(dpid, None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def stop_all_stunnel(self):
+        """Kill every stunnel started from this repo's config dir (explicit `reset` only)."""
+        for pid in find_all_stunnel_pids(self.hybrid_conf_dir):
+            _AdoptedProc(pid).terminate()
+        self._client_procs.clear()
+        self._server_proc = None
+
+    def _ovs_targets(self, bridge: str) -> list[str]:
+        rc, txt, _e = self.runner.run(["ovs-vsctl", "get-controller", bridge],
+                                      timeout=self.handshake_probe_timeout)
+        return txt.split() if rc == 0 else []
+
+    def _hybrid_target_for(self, dpid: str, bridge: str) -> str:
+        return f"tcp:127.0.0.1:{local_port_for_dpid(dpid, name=bridge)}"
+
+    def _wait_target_connected(self, bridge: str, target: str, timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self._controller_target_connected(bridge, target):
+                return True
+            time.sleep(0.5)
+        return self._controller_target_connected(bridge, target)
+
+    def reconcile(self, graph=None, restore_timeout: float = 20.0) -> dict:
+        """
+        Make reality (OVS + stunnel) match the persisted state, and the persisted state match
+        reality where the store has no opinion. Safe to run any number of times, from any
+        process. Returns {dpid: "Legacy"|"Hybrid"}.
+
+          store says Hybrid : make sure the stunnel pair is alive (adopt, or restart) and that
+                              OVS points ONLY at this switch's Hybrid target (re-applied if the
+                              testbed was rebuilt and OVS lost it). If the Hybrid path cannot
+                              be restored the switch goes back to Legacy -- never left dead.
+          store says Legacy : stale Hybrid targets are removed (OVS -> Legacy-only).
+          store has no row  : adopt what OVS is doing (connected Hybrid-only -> Hybrid,
+                              otherwise Legacy and any dead Hybrid target is removed).
+        """
+        graph = graph if graph is not None else self.topology.get_graph()
+        legacy = f"ssl:{self.controller_ip}:{self.legacy_port}"
+        out = {}
+        for dpid in sorted(graph.nodes):
+            try:
+                bridge = self._resolve_switch_name(dpid)
+            except Exception as exc:
+                self._log(f"reconcile: {dpid} has no OVS bridge right now ({exc}); keeping stored state")
+                out[dpid] = self.topology.get_state(dpid)
+                continue
+            try:
+                with self._switch_lock(dpid):
+                    out[dpid] = self._reconcile_one(dpid, bridge, legacy, restore_timeout)
+            except Exception as exc:
+                self._audit("reconcile-error", f"reconcile failed for {bridge}: {exc}", dpid)
+                out[dpid] = self.topology.get_state(dpid)
+        nh = sum(v == "Hybrid" for v in out.values())
+        self._audit("reconcile", f"reconciled: {nh} Hybrid, {len(out) - nh} Legacy")
+        return out
+
+    def _reconcile_one(self, dpid, bridge, legacy, restore_timeout) -> str:
+        hyb = self._hybrid_target_for(dpid, bridge)
+        targets = self._ovs_targets(bridge)
+        known = self.store.get_switch(dpid) if self.store is not None else None
+        desired = known["state"] if known else None
+
+        if desired is None:      # first time we hear of this switch: trust OVS
+            if targets == [hyb] and self._controller_target_connected(bridge, hyb):
+                desired = "Hybrid"
+                self._audit("adopt", f"{bridge}: found connected Hybrid-only target {hyb}; adopting as Hybrid", dpid)
+            else:
+                desired = "Legacy"
+
+        if desired == "Hybrid":
+            ok, why = self._ensure_stunnel_pair_up(dpid, bridge, local_port_for_dpid(dpid, name=bridge))
+            if ok:
+                if targets != [hyb]:
+                    self._audit("restore", f"{bridge}: OVS targets were {targets or 'NONE'}; re-applying Hybrid-only {hyb}", dpid)
+                    self._set_controller_target(bridge, hyb)
+                if self._wait_target_connected(bridge, hyb, restore_timeout):
+                    self.topology.set_state(dpid, "Hybrid")
+                    return "Hybrid"
+                why = f"{hyb} did not connect within {restore_timeout}s"
+            self._audit("restore-failed", f"{bridge}: Hybrid could not be restored ({why}); falling back to Legacy", dpid)
+            self._set_controller_target(bridge, legacy)
+            self._wait_target_connected(bridge, legacy, restore_timeout)
+            self.topology.set_state(dpid, "Legacy")
+            if self.store is not None:
+                self.store.delete_baseline(dpid, "hybrid")
+            return "Legacy"
+
+        # desired Legacy
+        if targets != [legacy]:
+            self._audit("fix", f"{bridge}: OVS targets {targets or 'NONE'} -> Legacy-only {legacy}", dpid)
+            self._set_controller_target(bridge, legacy)
+        self.topology.set_state(dpid, "Legacy")
+        return "Legacy"
+
+    def ensure_hybrid_tunnels(self, dpids) -> list[str]:
+        """Supervisor: for each given Hybrid switch make sure its stunnel client (and the
+        shared server) is alive; restart a dead one. Returns the dpids it had to restart."""
+        restarted = []
+        for d in dpids:
+            try:
+                bridge = self._resolve_switch_name(d)
+            except Exception:
+                continue
+            had = self._client_procs.get(d)
+            if had is None or had.poll() is not None:
+                self.adopt_running([d])
+            was_alive = d in self._client_procs and self._client_procs[d].poll() is None
+            srv_alive = self._server_proc is not None and self._server_proc.poll() is None
+            if not srv_alive:
+                self._server_proc = self._adopt(self.server_conf_path)
+                srv_alive = self._server_proc is not None
+            if was_alive and srv_alive:
+                continue
+            ok, why = self._ensure_stunnel_pair_up(d, bridge, local_port_for_dpid(d, name=bridge))
+            self._audit("tunnel-restart", f"{bridge}: stunnel pair was down, restart {'ok' if ok else 'FAILED: ' + str(why)}", d, source="supervisor")
+            restarted.append(d)
+        return restarted
+
+    def finalize_rollback(self, dpid: str):
+        """Bookkeeping after a verified rollback to Legacy: persist it, drop the now-stale
+        Hybrid baseline, and stop that switch's (now unused) stunnel client."""
+        if self.store is not None:
+            self.store.set_state(dpid, "Legacy")
+            self.store.delete_baseline(dpid, "hybrid")
+        try:
+            self.stop_client(dpid)
+        except Exception as exc:
+            self._log(f"could not stop stunnel client for {dpid}: {exc}")
+
+    def force_rollback(self, dpid: str, reason: str = "manual rollback") -> dict:
+        """Operator rollback of a Hybrid switch that has no 'success' ledger record (e.g. one
+        adopted from OVS). Same end state as the monitor's rollback: Legacy-only, verified."""
+        bridge = self._resolve_switch_name(dpid)
+        legacy = f"ssl:{self.controller_ip}:{self.legacy_port}"
+        with self._switch_lock(dpid):
+            t0 = time.monotonic()
+            rc, out, err = self._set_controller_target(bridge, legacy)
+            if rc != 0:
+                return {"dpid": dpid, "outcome": "failed",
+                        "reason": f"ovs-vsctl set-controller failed: {(err or out).strip()}"}
+            if not self._wait_target_connected(bridge, legacy, 15.0):
+                return {"dpid": dpid, "outcome": "failed",
+                        "reason": "Legacy controller connection not verified after 15s"}
+            ms = (time.monotonic() - t0) * 1000.0
+            self.topology.set_state(dpid, "Legacy")
+            self.finalize_rollback(dpid)
+            self.ledger.log_event(dpid, None, None, outcome="reverted", reason=reason,
+                                  recovery_latency_ms=ms)
+            return {"dpid": dpid, "outcome": "reverted", "reason": reason,
+                    "recovery_latency_ms": ms}
+
+    def reset_runtime(self, graph=None):
+        """Explicit full reset: every bridge back to Legacy, all stunnel killed, store state cleared."""
+        graph = graph if graph is not None else self.topology.get_graph()
+        legacy = f"ssl:{self.controller_ip}:{self.legacy_port}"
+        for d in graph.nodes:
+            try:
+                self._set_controller_target(self._resolve_switch_name(d), legacy)
+            except Exception:
+                pass
+            self.topology.set_state(d, "Legacy")
+        self.stop_all_stunnel()
 
     # -----------------------------------------------------------------
     # Switch-name resolution (dpid -> OVS bridge name)
@@ -684,9 +1019,18 @@ class MigrationExecutor:
         os.makedirs(self.hybrid_log_dir, exist_ok=True)
 
         if self._server_proc is None or self._server_proc.poll() is not None:
-            server_conf = os.path.join(self.hybrid_conf_dir, "server.conf")
-            if not os.path.exists(server_conf):
-                return False, f"shared Hybrid server conf not found: {server_conf}"
+            if not os.path.exists(self.server_conf_template):
+                return False, f"shared Hybrid server conf not found: {self.server_conf_template}"
+            server_conf = self.render_server_conf()
+            # A server left running by an earlier run (same rendered config) is reused.
+            self._server_proc = self._adopt(server_conf)
+        if self._server_proc is None or self._server_proc.poll() is not None:
+            # A server started by hand / by an older version from the TEMPLATE path would hold
+            # port 16653 and make the new one fail with "address already in use": stop it.
+            for pid in find_stunnel_pids(self.server_conf_template):
+                self._log(f"stopping stale stunnel server pid={pid} (started from the template path)")
+                _AdoptedProc(pid).terminate()
+            time.sleep(0.3)
             self._log(f"starting shared Hybrid stunnel server ({server_conf})")
             # stderr captured to a file: stunnel prints config/startup
             # errors there BEFORE its own `output =` log file is open.
@@ -711,6 +1055,10 @@ class MigrationExecutor:
                 time.sleep(0.1)
 
         proc = self._client_procs.get(dpid)
+        if proc is None or proc.poll() is not None:
+            proc = self._adopt(os.path.join(self.hybrid_conf_dir, f"client_{dpid}.conf"))
+            if proc is not None:
+                self._client_procs[dpid] = proc
         if proc is None or proc.poll() is not None:
             client_conf_path = os.path.join(self.hybrid_conf_dir, f"client_{dpid}.conf")
             with open(client_conf_path, "w") as fh:
@@ -788,6 +1136,11 @@ class MigrationExecutor:
         _ensure_stunnel_pair_up), so a match here belongs to THIS
         migration attempt, not a previous run.
         """
+        log_path = os.path.join(self.hybrid_log_dir, f"client_{dpid}.log")
+        try:
+            log_start = os.path.getsize(log_path)
+        except OSError:
+            log_start = 0
         try:
             with socket.create_connection(("127.0.0.1", local_port), timeout=self.handshake_probe_timeout) as s:
                 s.settimeout(0.5)
@@ -798,11 +1151,12 @@ class MigrationExecutor:
         except OSError as exc:
             return False, f"could not reach local Hybrid stunnel client on port {local_port}: {exc}"
 
-        log_path = os.path.join(self.hybrid_log_dir, f"client_{dpid}.log")
         deadline = time.monotonic() + self.dry_run_log_wait
         while time.monotonic() < deadline:
             if os.path.exists(log_path):
                 with open(log_path, "r", errors="replace") as fh:
+                    if os.path.getsize(log_path) >= log_start:
+                        fh.seek(log_start)
                     text = fh.read()
                 if self._HANDSHAKE_OK_RE.search(text):
                     m = self._PEER_TMP_KEY_RE.search(text)
@@ -1072,6 +1426,11 @@ class MigrationExecutor:
     # -----------------------------------------------------------------
 
     def migrate(self, dpid: str) -> dict:
+        """Serialised wrapper: only one process may migrate/roll back a given switch at a time."""
+        with self._switch_lock(dpid):
+            return self._migrate_locked(dpid)
+
+    def _migrate_locked(self, dpid: str) -> dict:
         """
         Run the full pre-flight + Break-Before-Make cutover for one
         switch. Safe to call repeatedly for the same dpid (e.g. after
@@ -1141,6 +1500,9 @@ class MigrationExecutor:
 
         # -- the one and only place in the system that flips Legacy -> Hybrid --
         self.topology.set_state(dpid, "Hybrid")
+        if self.store is not None:
+            self.store.set_state(dpid, "Hybrid", name=switch_name, hybrid_port=local_port)
+            self.store.delete_baseline(dpid, "hybrid")   # monitor re-measures the new Hybrid path
         self.ledger.log_event(dpid, baseline, post, outcome="success")
         self._log(
             f"{dpid} ({switch_name}) migrated to Hybrid successfully "

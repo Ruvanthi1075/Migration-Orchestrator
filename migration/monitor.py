@@ -36,6 +36,7 @@ production path must use latency_probe or the live QSMO echo-probe app.
 from __future__ import annotations
 
 from collections import deque
+import contextlib
 import logging
 import math
 import statistics
@@ -507,6 +508,31 @@ class MigrationMonitor:
             "percent_change": percent,
         }
 
+    # ------------------------------------------------------------------
+    # Persistence (migration/store.py) -- baselines survive restarts
+    # ------------------------------------------------------------------
+
+    def load_from_store(self, store, dpids: Optional[Iterable[str]] = None) -> None:
+        """Restore saved Legacy/Hybrid baselines (only for `dpids` if given)."""
+        keep = set(dpids) if dpids is not None else None
+        for kind, dest in (("legacy", self._baselines), ("hybrid", self._post_migration)):
+            for dpid, data in store.load_baselines(kind).items():
+                if keep is None or dpid in keep:
+                    dest[dpid] = data
+        for dpid, post in self._post_migration.items():
+            self._rolling_latencies.setdefault(dpid, deque(maxlen=self.config.rolling_window))
+            self._rolling_failures.setdefault(dpid, deque(maxlen=self.config.failure_window))
+            legacy = self._baselines.get(dpid)
+            if legacy and dpid not in self._migration_report:
+                self._migration_report[dpid] = self._compare_baselines(legacy, post)
+
+    def save_to_store(self, store, dpids: Optional[Iterable[str]] = None) -> None:
+        keep = set(dpids) if dpids is not None else None
+        for kind, src in (("legacy", self._baselines), ("hybrid", self._post_migration)):
+            for dpid, data in src.items():
+                if keep is None or dpid in keep:
+                    store.save_baseline(dpid, kind, data)
+
     def migration_report(self) -> Dict[str, Dict[str, Any]]:
         """Return per-switch Legacy-vs-Hybrid results collected in this run."""
         return {dpid: dict(report) for dpid, report in self._migration_report.items()}
@@ -831,6 +857,15 @@ class MigrationMonitor:
         switch_name = self.resolve_switch_name(dpid)
         legacy_target = f"ssl:{self.executor.controller_ip}:{self.executor.legacy_port}"
 
+        # one rollback/migration per switch at a time, across processes
+        _lock = getattr(self.executor, "_switch_lock", None)
+        with (_lock(dpid) if _lock else contextlib.nullcontext()):
+            return self._rollback_locked(
+                dpid, reason, associated_flows, baseline, post, switch_name, legacy_target
+            )
+
+    def _rollback_locked(self, dpid, reason, associated_flows, baseline, post,
+                         switch_name, legacy_target) -> Dict[str, Any]:
         try:
             recovery_start = time.monotonic()
 
@@ -851,6 +886,12 @@ class MigrationMonitor:
                 if self.executor._controller_target_connected(switch_name, legacy_target):
                     recovery_latency_ms = (time.monotonic() - recovery_start) * 1000.0
                     self.topology.set_state(dpid, "Legacy")
+                    finalize = getattr(self.executor, "finalize_rollback", None)
+                    if finalize:
+                        finalize(dpid)
+                    self._post_migration.pop(dpid, None)
+                    self._rolling_latencies.pop(dpid, None)
+                    self._rolling_failures.pop(dpid, None)
                     self.ledger.log_event(
                         dpid,
                         baseline,
